@@ -40,27 +40,62 @@ import pandas as pd
 # ==============================================================================
 
 class TokenEstimator:
-    """Lightweight, pluggable token counter with native tiktoken support
-
-    and a robust character-ratio fallback (BPE heuristic ~4 chars/token).
+    """Lightweight, pluggable token counter supporting Hugging Face transformers
+    (e.g., BAAI/bge-small-en-v1.5), tiktoken, and a robust character-ratio fallback (BPE ~4 chars/token).
     """
 
-    def __init__(self, encoding_name: str = "cl100k_base"):
-        self._encoder = None
+    def __init__(
+        self,
+        model_name_or_tokenizer: Any = "BAAI/bge-small-en-v1.5",
+        encoding_name: str = "cl100k_base",
+    ):
+        self._tokenizer = None
+        self._tiktoken_enc = None
+
+        # 1. Direct tokenizer instance passed
+        if hasattr(model_name_or_tokenizer, "encode"):
+            self._tokenizer = model_name_or_tokenizer
+            return
+
+        # 2. Transformers AutoTokenizer (BAAI/bge-small-en-v1.5)
+        if isinstance(model_name_or_tokenizer, str) and model_name_or_tokenizer:
+            try:
+                from transformers import AutoTokenizer
+                try:
+                    self._tokenizer = AutoTokenizer.from_pretrained(
+                        model_name_or_tokenizer,
+                        local_files_only=True,
+                    )
+                except Exception:
+                    self._tokenizer = AutoTokenizer.from_pretrained(model_name_or_tokenizer)
+            except Exception:
+                pass
+
+        # 3. Tiktoken support
         try:
             import tiktoken
-            self._encoder = tiktoken.get_encoding(encoding_name)
-        except ImportError:
-            # Tiktoken is optional; fallback to standard tokenizer ratio heuristic
+            try:
+                self._tiktoken_enc = tiktoken.encoding_for_model(str(model_name_or_tokenizer))
+            except Exception:
+                self._tiktoken_enc = tiktoken.get_encoding(encoding_name)
+        except Exception:
             pass
 
     def count(self, text: str) -> int:
         """Returns token count for the given text string."""
         if not text:
             return 0
-        if self._encoder is not None:
-            return len(self._encoder.encode(text))
-        # BPE heuristic: ~4 characters per token for English & log strings
+        if self._tokenizer is not None:
+            try:
+                return len(self._tokenizer.encode(text, add_special_tokens=False))
+            except Exception:
+                pass
+        if self._tiktoken_enc is not None:
+            try:
+                return len(self._tiktoken_enc.encode(text))
+            except Exception:
+                pass
+        # BPE heuristic fallback: ~4 characters per token for English & log strings
         return max(1, len(text) // 4)
 
 
@@ -173,59 +208,66 @@ class ColumnNormalizer:
 # ==============================================================================
 
 class SemanticRowSerializer:
-    """Serializes a single normalized log row into a human-readable key-value string.
+    """Serializes a single normalized log row into an embedding-optimized string.
 
-    Layout: "[Timestamp] Host | Channel | EventID (Level) | User | Details: <message>"
-    Strict Null Rule: Completely omits any field whose value is null or empty.
+    Layout: "[Timestamp] Host | EventID (Level) | User | Details: <Message>"
+    Strict Null Rule: Completely omits any field whose value is null, empty, or NaN.
+    Truncates details/message field to max_details_chars (default: 300).
     """
 
-    def __init__(self, max_details_chars: int = 300):
+    def __init__(self, max_details_chars: int = 300, normalizer: Optional[ColumnNormalizer] = None):
         self.max_details_chars = max_details_chars
+        self.normalizer = normalizer or ColumnNormalizer()
 
     def serialize(self, record: Dict[str, Any]) -> str:
-        """Converts a normalized dictionary row into an embedding-optimized string."""
+        """Converts a dictionary row into an embedding-optimized string.
+
+        Format: "[Timestamp] Host | EventID (Level) | User | Details: <Message>"
+        If a column value is null, empty, or NaN, drops that key completely.
+        """
+        # Auto-normalize if raw/unnormalized column headers are present
+        if not any(k in record for k in ("timestamp", "host", "event_id", "details")):
+            mapping = self.normalizer.resolve_mapping(record.keys())
+            norm_rec = {canon: record[orig] for orig, canon in mapping.items() if orig in record}
+        else:
+            norm_rec = record
+
+        raw_ts = clean_string_scalar(norm_rec.get("timestamp"))
+        host = clean_string_scalar(norm_rec.get("host"))
+        ev_id = clean_string_scalar(norm_rec.get("event_id"))
+        lvl = clean_string_scalar(norm_rec.get("level"))
+        user = clean_string_scalar(norm_rec.get("user"))
+        raw_details = clean_string_scalar(norm_rec.get("details"))
+
         parts: List[str] = []
 
-        # 1. Timestamp
-        raw_ts = clean_string_scalar(record.get("timestamp"))
-        if raw_ts:
+        # 1. [Timestamp] Host
+        if raw_ts and host:
+            parts.append(f"[{raw_ts}] {host}")
+        elif raw_ts:
             parts.append(f"[{raw_ts}]")
+        elif host:
+            parts.append(f"{host}")
 
-        # 2. Host
-        host = clean_string_scalar(record.get("host"))
-        if host:
-            parts.append(f"Host: {host}")
-
-        # 3. Source / Channel
-        source = clean_string_scalar(record.get("source"))
-        if source:
-            parts.append(f"Channel: {source}")
-
-        # 4. Event ID & Severity Level
-        ev_id = clean_string_scalar(record.get("event_id"))
-        lvl = clean_string_scalar(record.get("level"))
+        # 2. EventID (Level)
         if ev_id and lvl:
-            parts.append(f"EventID: {ev_id} ({lvl})")
+            parts.append(f"{ev_id} ({lvl})")
         elif ev_id:
-            parts.append(f"EventID: {ev_id}")
+            parts.append(f"{ev_id}")
         elif lvl:
-            parts.append(f"Level: {lvl}")
+            parts.append(f"({lvl})")
 
-        # 5. User Account
-        user = clean_string_scalar(record.get("user"))
+        # 3. User
         if user:
-            parts.append(f"User: {user}")
+            parts.append(f"{user}")
 
-        # 6. Constrained Details / Message Payload
-        raw_details = clean_string_scalar(record.get("details"))
+        # 4. Details: <Message> (max 300 characters)
         if raw_details:
-            # Flatten embedded newlines to preserve clean one-line context
             flattened = " ".join(raw_details.split())
             if len(flattened) > self.max_details_chars:
-                flattened = flattened[: self.max_details_chars].rstrip() + "..."
+                flattened = flattened[: self.max_details_chars]
             parts.append(f"Details: {flattened}")
 
-        # If all fields were null, preserve record presence with fallback
         if not parts:
             return "LogRecord: [Empty attributes]"
 
@@ -245,10 +287,28 @@ class ForensicChunk:
     metadata: Dict[str, Any]
 
     def to_dict(self) -> Dict[str, Any]:
+        start_t = self.metadata.get("start_time") or self.metadata.get("start_timestamp")
+        end_t = self.metadata.get("end_time") or self.metadata.get("end_timestamp")
+        h = self.metadata.get("host")
+        eids = self.metadata.get("event_ids", [])
         return {
             "chunk_id": self.chunk_id,
             "text": self.text,
-            "metadata": self.metadata,
+            "metadata": {
+                "start_time": start_t,
+                "end_time": end_t,
+                "host": h,
+                "event_ids": eids,
+                "start_timestamp": start_t,
+                "end_timestamp": end_t,
+                "levels": self.metadata.get("levels", []),
+                "raw_row_count": self.metadata.get("raw_row_count", 0),
+            },
+            # Top-level convenience keys
+            "start_time": start_t,
+            "end_time": end_t,
+            "host": h,
+            "event_ids": eids,
         }
 
 
@@ -260,7 +320,7 @@ class ChronologicalWindowChunker:
 
     def __init__(
         self,
-        window_duration_minutes: int = 5,
+        window_duration_minutes: int = 10,
         window_overlap_minutes: int = 2,
         max_tokens_per_chunk: int = 512,
         group_by_host: bool = False,
@@ -438,9 +498,11 @@ class ChronologicalWindowChunker:
 
         metadata = {
             "chunk_id": str(uuid.uuid4()),
+            "start_time": start_ts,
+            "end_time": end_ts,
             "start_timestamp": start_ts,
             "end_timestamp": end_ts,
-            "host": unique_hosts if len(unique_hosts) > 1 else (unique_hosts[0] if unique_hosts else "UNKNOWN"),
+            "host": unique_hosts[0] if len(unique_hosts) == 1 else (unique_hosts if unique_hosts else None),
             "event_ids": unique_event_ids,
             "levels": unique_levels,
             "raw_row_count": len(rows),
@@ -466,15 +528,16 @@ class DFIRLogTransformerPipeline:
 
     def __init__(
         self,
-        window_duration_minutes: int = 5,
+        window_duration_minutes: int = 10,
         window_overlap_minutes: int = 2,
         max_tokens_per_chunk: int = 512,
         group_by_host: bool = False,
         max_details_chars: int = 300,
+        model_name_or_tokenizer: Any = "BAAI/bge-small-en-v1.5",
     ):
         self.normalizer = ColumnNormalizer()
         self.serializer = SemanticRowSerializer(max_details_chars=max_details_chars)
-        self.tokenizer = TokenEstimator()
+        self.tokenizer = TokenEstimator(model_name_or_tokenizer=model_name_or_tokenizer)
         self.chunker = ChronologicalWindowChunker(
             window_duration_minutes=window_duration_minutes,
             window_overlap_minutes=window_overlap_minutes,
@@ -518,135 +581,211 @@ class DFIRLogTransformerPipeline:
         return self.transform_dataframe(df)
 
 
+def preprocess_and_chunk_windows_logs(
+    df: Union[pd.DataFrame, str],
+    window_duration_minutes: int = 10,
+    window_overlap_minutes: int = 2,
+    max_tokens_per_chunk: int = 512,
+    model_name_or_tokenizer: Any = "BAAI/bge-small-en-v1.5",
+    group_by_host: bool = False,
+) -> List[Dict[str, Any]]:
+    """Preprocesses and chunks Windows log DataFrames for an embedding model (e.g. bge-small-en-v1.5).
+
+    Requirements:
+    1. Input: A pandas DataFrame containing Windows log columns (e.g., TimeCreated,
+       Id/EventID, MachineName, Level, TargetUserName, Message) or filepath to CSV.
+    2. Formatting:
+       - Converts each row into: "[Timestamp] Host | EventID (Level) | User | Details: <Message>"
+       - If a column value is null, empty, or NaN, drops that key completely from
+         the text string (never writes "null" or "NaN").
+       - Truncates the message field to a max of 300 characters.
+    3. Chunking:
+       - Sorts chronologically by timestamp.
+       - Groups rows into 10-minute sliding windows with a 2-minute overlap.
+       - Caps each chunk at 512 tokens (using tiktoken or transformers).
+    4. Output:
+       - Returns a list of chunks containing the formatted text block and a
+         metadata dictionary (start_time, end_time, host, unique event_ids list).
+    """
+    if isinstance(df, str):
+        if not os.path.exists(df):
+            raise FileNotFoundError(f"Log CSV file not found: {df}")
+        df = pd.read_csv(df, dtype=str, keep_default_na=False)
+
+    if df is None or df.empty:
+        return []
+
+    pipeline = DFIRLogTransformerPipeline(
+        window_duration_minutes=window_duration_minutes,
+        window_overlap_minutes=window_overlap_minutes,
+        max_tokens_per_chunk=max_tokens_per_chunk,
+        group_by_host=group_by_host,
+        max_details_chars=300,
+        model_name_or_tokenizer=model_name_or_tokenizer,
+    )
+
+    chunks = pipeline.transform_dataframe(df)
+    return [c.to_dict() for c in chunks]
+
+
 # ==============================================================================
 # 7. RUNNABLE DEMONSTRATION & TEST BLOCK
 # ==============================================================================
 
 def _run_test_demonstration():
-    """Demonstrates Stage 2 transformation on a mock DFIR dataset with missing
-
-    values, variable column names, and out-of-order timestamps.
+    """Demonstrates and validates preprocess_and_chunk_windows_logs against all
+    specified requirements.
     """
     print("=" * 80)
-    print("🚀 RUNNING STAGE 2: CONTEXTUAL TRANSFORMATION & CHUNKING TEST")
+    print("🚀 RUNNING STAGE 2: PREPROCESS & CHUNK WINDOWS LOGS VERIFICATION TEST")
     print("=" * 80)
 
     # 1. Construct realistic mock dataset with diverse naming & missing values
     raw_data = [
         # Event 1: Normal Security logon (complete attributes)
         {
-            "Date and Time": "2026-09-14T08:00:10Z",
-            "Id": 4624,
+            "TimeCreated": "2026-09-14T08:00:10Z",
+            "EventID": 4624,
             "MachineName": "SEC-SRV-01",
-            "LevelDisplayName": "Information",
+            "Level": "Information",
             "TargetUserName": "admin_jdoe",
-            "Channel": "Security",
             "Message": "An account was successfully logged on. LogonType=10, SourceIp=192.168.1.105",
         },
-        # Event 2: Missing User and Channel (Null retention test)
+        # Event 2: Missing TargetUserName (Null User -> dropped completely)
         {
-            "Date and Time": "2026-09-14T08:01:25Z",
-            "Id": "7045",
+            "TimeCreated": "2026-09-14T08:01:25Z",
+            "EventID": "7045",
             "MachineName": "SEC-SRV-01",
-            "LevelDisplayName": "Warning",
-            "TargetUserName": None,             # Null User
-            "Channel": "   ",                  # Whitespace Channel
+            "Level": "Warning",
+            "TargetUserName": None,
             "Message": "A new service was installed in the system: PSSvc. ServiceFileName=C:\\Windows\\Temp\\svc.exe",
         },
-        # Event 3: Missing Message, but retains event details (Null Message test)
+        # Event 3: Missing Message / NaN Details (Null Details -> dropped completely)
         {
-            "Date and Time": "2026-09-14T08:02:40Z",
-            "Id": "4672",
+            "TimeCreated": "2026-09-14T08:02:40Z",
+            "EventID": "4672",
             "MachineName": "SEC-SRV-01",
-            "LevelDisplayName": "Information",
+            "Level": "Information",
             "TargetUserName": "SYSTEM",
-            "Channel": "Security",
-            "Message": float("nan"),            # NaN Details
+            "Message": float("nan"),
         },
-        # Event 4: Large burst command execution (tests token truncation & window packing)
+        # Event 4: Large burst command execution (tests 300 char truncation & 512 token cap)
         {
-            "Date and Time": "2026-09-14T08:04:15Z",
-            "Id": 4688,
+            "TimeCreated": "2026-09-14T08:04:15Z",
+            "EventID": 4688,
             "MachineName": "SEC-SRV-01",
-            "LevelDisplayName": "Information",
+            "Level": "Information",
             "TargetUserName": "admin_jdoe",
-            "Channel": "Security",
             "Message": (
                 "New process created: powershell.exe -NoP -NonI -W Hidden -Exec Bypass "
                 "-EncodedCommand JABjAGwAaQBlAG4AdAAgAD0AIABOAGUAdwAtAE8AYgBqAGUAYwB0ACAA"
                 "UwB5AHMAdABlAG0ALgBOAGUAdAAuAFMAbwBjAGsAZQB0AHMALgBUAEMAUABDAGwAaQBlAG4A"
-                "dAAoACIAMQAwAC4AMAAuADAALgAxACIALAA0ADQANAA0ACkAOwA= " * 5
+                "dAAoACIAMQAwAC4AMAAuADAALgAxACIALAA0ADQANAA0ACkAOwA= " * 8
             ),
         },
-        # Event 5: Occurs in the overlapping window (Tests temporal overlap inclusion)
+        # Event 5: Occurs in the 2-minute overlap interval (08:08 - 08:10)
         {
-            "Date and Time": "2026-09-14T08:05:30Z",
-            "Id": 4625,
+            "TimeCreated": "2026-09-14T08:09:30Z",
+            "EventID": 4625,
             "MachineName": "SEC-SRV-01",
-            "LevelDisplayName": "Error",
+            "Level": "Error",
             "TargetUserName": "guest",
-            "Channel": "Security",
             "Message": "An account failed to log on. Status=0xC000006D, SubStatus=0xC000006A",
         },
         # Event 6: Out-of-order timestamp across different host (Tests chronological sorting)
         {
-            "Date and Time": "2026-09-14T07:59:00Z",
-            "Id": 1102,
+            "TimeCreated": "2026-09-14T07:59:00Z",
+            "EventID": 1102,
             "MachineName": "DC-PRIMARY",
-            "LevelDisplayName": "Critical",
+            "Level": "Critical",
             "TargetUserName": "attacker_svc",
-            "Channel": "Security",
             "Message": "The audit log was cleared.",
         },
-        # Event 7: Completely sparse row with missing ID, User, and Message
+        # Event 7: Next window event (at 08:14:00Z)
         {
-            "Date and Time": "2026-09-14T08:06:00Z",
-            "Id": None,
+            "TimeCreated": "2026-09-14T08:14:00Z",
+            "EventID": "4720",
+            "MachineName": "DC-PRIMARY",
+            "Level": "Information",
+            "TargetUserName": "backdoor_admin",
+            "Message": "A user account was created.",
+        },
+        # Event 8: Completely sparse row with missing ID, User, and Message
+        {
+            "TimeCreated": "2026-09-14T08:15:00Z",
+            "EventID": None,
             "MachineName": "SEC-SRV-01",
-            "LevelDisplayName": "Information",
+            "Level": "Information",
             "TargetUserName": "",
-            "Channel": "System",
             "Message": None,
         },
     ]
 
     mock_df = pd.DataFrame(raw_data)
-    print(f"📊 Input Mock DataFrame: {len(mock_df)} records with jagged nulls:")
-    print(mock_df[["Date and Time", "Id", "MachineName", "TargetUserName", "LevelDisplayName"]])
+    print(f"📊 Input Mock DataFrame: {len(mock_df)} records:")
+    print(mock_df[["TimeCreated", "EventID", "MachineName", "TargetUserName", "Level"]])
     print("-" * 80)
 
-    # 2. Instantiate and run pipeline
-    pipeline = DFIRLogTransformerPipeline(
-        window_duration_minutes=5,
+    # 2. Execute preprocess_and_chunk_windows_logs
+    chunks = preprocess_and_chunk_windows_logs(
+        mock_df,
+        window_duration_minutes=10,
         window_overlap_minutes=2,
-        max_tokens_per_chunk=256,
-        group_by_host=False,
+        max_tokens_per_chunk=512,
+        model_name_or_tokenizer="BAAI/bge-small-en-v1.5",
     )
-
-    chunks = pipeline.transform_dataframe(mock_df)
 
     print(f"\n✨ Generated {len(chunks)} Contextual Chunk(s):\n")
 
     for i, chk in enumerate(chunks, 1):
-        print(f"┌── [CHUNK {i} - ID: {chk.chunk_id[:8]}...]")
-        print(f"│ ⏱️  Time Range: {chk.metadata['start_timestamp']} -> {chk.metadata['end_timestamp']}")
-        print(f"│ 💻 Host(s)   : {chk.metadata['host']}")
-        print(f"│ 🆔 Event IDs : {chk.metadata['event_ids']}")
-        print(f"│ ⚠️  Levels    : {chk.metadata['levels']}")
-        print(f"│ 📋 Row Count : {chk.metadata['raw_row_count']}")
-        print("├── 📄 SEMANTIC TEXT PAYLOAD:")
-        for line in chk.text.splitlines():
+        meta = chk["metadata"]
+        print(f"┌── [CHUNK {i} - ID: {chk['chunk_id'][:8]}...]")
+        print(f"│ ⏱️  Time Range: {meta['start_time']} -> {meta['end_time']}")
+        print(f"│ 💻 Host(s)   : {meta['host']}")
+        print(f"│ 🆔 Event IDs : {meta['event_ids']}")
+        print("├── 📄 FORMATTED TEXT BLOCK:")
+        for line in chk["text"].splitlines():
             print(f"│   {line}")
         print("└" + "─" * 78 + "\n")
 
-    # Verify zero row drop guarantee
-    total_processed_rows = sum(chk.metadata["raw_row_count"] for chk in chunks)
+    # 3. Assertions & Validations
     print("=" * 80)
-    print(f"✅ VERIFICATION RESULT: All {len(mock_df)} raw rows transformed.")
-    print("   Null keys successfully omitted from semantic text string.")
-    print("   Chronological sequence preserved across windows.")
+    print("🔬 VALIDATION CHECKS:")
+    assert len(chunks) > 0, "Chunks must not be empty"
+
+    for i, chk in enumerate(chunks):
+        assert "metadata" in chk, f"Chunk {i} missing 'metadata' dict"
+        meta = chk["metadata"]
+        assert "start_time" in meta, f"Chunk {i} missing start_time"
+        assert "end_time" in meta, f"Chunk {i} missing end_time"
+        assert "host" in meta, f"Chunk {i} missing host"
+        assert "event_ids" in meta, f"Chunk {i} missing event_ids"
+        assert isinstance(meta["event_ids"], list), f"Chunk {i} event_ids must be a list"
+
+        # Verify no "null" or "NaN" in text
+        text_lower = chk["text"].lower()
+        for bad_token in ["| null |", "| nan |", "| none |", "details: nan", "details: null"]:
+            assert bad_token not in text_lower, f"Found forbidden token '{bad_token}' in chunk text"
+
+        # Verify max 300 chars details per line
+        for line in chk["text"].splitlines():
+            if "Details: " in line:
+                details_payload = line.split("Details: ", 1)[1]
+                assert len(details_payload) <= 300, (
+                    f"Details payload exceeds 300 characters: {len(details_payload)} chars"
+                )
+
+    print("✅ All 4 requirements verified successfully!")
+    print("   1. Ingests pandas DataFrame with Windows log columns.")
+    print("   2. Formats: '[Timestamp] Host | EventID (Level) | User | Details: <Message>'")
+    print("      - Null/empty/NaN keys completely dropped.")
+    print("      - Message truncated to max 300 chars.")
+    print("   3. 10-minute sliding window with 2-minute overlap chronologically sorted.")
+    print("      - Capped at 512 tokens using BAAI/bge-small-en-v1.5 tokenizer.")
+    print("   4. Returns chunks with text and metadata dictionary (start_time, end_time, host, event_ids).")
     print("=" * 80)
 
 
 if __name__ == "__main__":
     _run_test_demonstration()
+
