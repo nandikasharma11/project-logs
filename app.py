@@ -224,8 +224,9 @@ def load_csv_data(filepath: str) -> pd.DataFrame:
     if not os.path.isfile(filepath):
         return pd.DataFrame()
     try:
-        df = pd.read_csv(filepath, dtype=str)
+        df = pd.read_csv(filepath, dtype=str, keep_default_na=False)
         df.fillna("", inplace=True)
+        df.replace({"null": "", "None": "", "NULL": "", "NaN": "", "nan": ""}, inplace=True)
         if "EventID" in df.columns:
             df["EventID"] = df["EventID"].apply(clean_event_id_scalar)
         return df
@@ -742,7 +743,17 @@ elif st.session_state["active_tab"] == "viewer":
                                 content = raw_event_data if tname == "EventData" else raw_user_data
                                 try:
                                     parsed = json.loads(content)
-                                    st.json(parsed)
+                                    def _clean_json_nulls(o: Any) -> Any:
+                                        if o is None:
+                                            return ""
+                                        if isinstance(o, str) and o.strip().lower() in ("null", "none", "nan"):
+                                            return ""
+                                        if isinstance(o, dict):
+                                            return {k: _clean_json_nulls(v) for k, v in o.items()}
+                                        if isinstance(o, list):
+                                            return [_clean_json_nulls(x) for x in o]
+                                        return o
+                                    st.json(_clean_json_nulls(parsed))
                                 except Exception:
                                     st.code(content, language="json" if content.startswith(("{", "[")) else "text")
                     else:

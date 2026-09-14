@@ -264,8 +264,7 @@ def find_evtx_dump_tool() -> str:
 
 def extract_scalar_value(val: Any) -> str:
     """Extracts a clean scalar string from various evtx_dump JSON structures,
-
-    handling dicts with '#text', '#attributes', or direct values.
+    handling dicts with '#text', '#attributes', or direct values, ensuring null values are empty strings.
     """
     if val is None:
         return ""
@@ -273,11 +272,14 @@ def extract_scalar_value(val: Any) -> str:
         return str(val).strip()
     if isinstance(val, str):
         s = val.strip()
+        if s.lower() in ("null", "none", "nan"):
+            return ""
         # Handle cases where dict string was stringified e.g. {'#text': 4624}
         if s.startswith("{") and "#text" in s:
             m = re.search(r"['\"]?#text['\"]?\s*:\s*['\"]?([^'\"}]+)['\"]?", s)
             if m:
-                return m.group(1).strip()
+                extracted = m.group(1).strip()
+                return "" if extracted.lower() in ("null", "none", "nan") else extracted
         return s
     if isinstance(val, dict):
         if "#text" in val:
@@ -301,32 +303,42 @@ def extract_scalar_value(val: Any) -> str:
             if "ActivityID" in attrs:
                 return extract_scalar_value(attrs["ActivityID"])
         if "Name" in val and "Value" in val:
-            return f"{val['Name']}={val['Value']}"
+            v_val = extract_scalar_value(val["Value"])
+            return f"{val['Name']}={v_val}" if v_val else extract_scalar_value(val["Name"])
         if "Name" in val:
             return extract_scalar_value(val["Name"])
         if len(val) == 1:
             return extract_scalar_value(next(iter(val.values())))
-        return json.dumps(val, ensure_ascii=False)
+        clean_d = {
+            str(k): ("" if v is None or (isinstance(v, str) and v.strip().lower() in ("null", "none", "nan")) else extract_scalar_value(v))
+            for k, v in val.items()
+        }
+        return json.dumps(clean_d, ensure_ascii=False)
     if isinstance(val, list):
-        return ", ".join(extract_scalar_value(x) for x in val if x is not None)
-    return str(val).strip()
+        clean_l = [extract_scalar_value(x) for x in val if x is not None]
+        return ", ".join(x for x in clean_l if x and x.lower() not in ("null", "none", "nan"))
+    s_val = str(val).strip()
+    return "" if s_val.lower() in ("null", "none", "nan") else s_val
 
 
 def clean_event_payload(data: Any) -> str:
     """Recursively normalizes EventData or UserData payloads, ensuring all values,
-
-    attributes, and nested structures are completely extracted into clean JSON.
+    attributes, and nested structures are completely extracted into clean JSON,
+    and ensuring any null / None values are converted to empty strings ("").
     """
     if data is None or data == "":
         return ""
 
     def _normalize(obj: Any) -> Any:
         if obj is None:
-            return None
+            return ""
         if isinstance(obj, (int, float, bool)):
             return obj
         if isinstance(obj, str):
-            return obj.strip()
+            s = obj.strip()
+            if s.lower() in ("null", "none", "nan"):
+                return ""
+            return s
         if isinstance(obj, list):
             # Check if this is a list of {"#attributes": {"Name": ...}, "#text": ...}
             if all(isinstance(x, dict) for x in obj):
@@ -339,12 +351,14 @@ def clean_event_payload(data: Any) -> str:
                     val = x.get("#text") if "#text" in x else (x.get("Value") if "Value" in x else None)
                     if name is not None:
                         is_named = True
-                        named_map[str(name)] = _normalize(val if val is not None else "")
+                        nval = _normalize(val if val is not None else "")
+                        named_map[str(name)] = "" if nval is None else nval
                     else:
-                        simple_list.append(_normalize(x))
+                        nx = _normalize(x)
+                        simple_list.append("" if nx is None else nx)
                 if is_named and not simple_list:
                     return named_map
-            return [_normalize(x) for x in obj]
+            return [("" if _normalize(x) is None else _normalize(x)) for x in obj]
         if isinstance(obj, dict):
             # Case A: {"Data": [...]} or {"Data": {...}}
             if len(obj) == 1 and "Data" in obj:
@@ -354,20 +368,25 @@ def clean_event_payload(data: Any) -> str:
                 attrs = obj["#attributes"]
                 if "Name" in attrs:
                     val = obj.get("#text", obj.get("Value", ""))
-                    return {str(attrs["Name"]): _normalize(val)}
+                    nval = _normalize(val if val is not None else "")
+                    return {str(attrs["Name"]): "" if nval is None else nval}
             # Case C: dictionary with nested items
             res = {}
             for k, v in obj.items():
                 if k == "#attributes" and isinstance(v, dict):
                     for ak, av in v.items():
                         if ak not in ("xmlns", "xmlns:auto-ns"):
-                            res[ak] = _normalize(av)
+                            nav = _normalize(av)
+                            res[ak] = "" if nav is None else nav
                 elif k == "#text":
-                    res["Value"] = _normalize(v)
+                    nv = _normalize(v)
+                    res["Value"] = "" if nv is None else nv
                 else:
-                    res[k] = _normalize(v)
+                    nv = _normalize(v)
+                    res[k] = "" if nv is None else nv
             return res
-        return str(obj)
+        s_val = str(obj).strip()
+        return "" if s_val.lower() in ("null", "none", "nan") else s_val
 
     cleaned = _normalize(data)
     if cleaned is None or cleaned == "" or cleaned == {} or cleaned == []:
@@ -375,6 +394,45 @@ def clean_event_payload(data: Any) -> str:
     if isinstance(cleaned, (dict, list)):
         return json.dumps(cleaned, ensure_ascii=False)
     return str(cleaned)
+
+
+def sanitize_record_row(row: Dict[str, Any]) -> Dict[str, str]:
+    """Ensures all 22 columns are present, and converts any null, None,
+    NaN, or placeholder values into empty strings ("").
+    """
+    clean_row: Dict[str, str] = {}
+    for col in CSV_COLUMNS:
+        val = row.get(col)
+        if val is None:
+            clean_row[col] = ""
+        elif isinstance(val, (int, float, bool)):
+            clean_row[col] = str(val).strip()
+        elif isinstance(val, str):
+            s = val.strip()
+            if s.startswith("{") or s.startswith("["):
+                try:
+                    parsed = json.loads(s)
+                    def _replace_nulls(o: Any) -> Any:
+                        if o is None:
+                            return ""
+                        if isinstance(o, str) and o.strip().lower() in ("null", "none", "nan"):
+                            return ""
+                        if isinstance(o, dict):
+                            return {k: _replace_nulls(v) for k, v in o.items()}
+                        if isinstance(o, list):
+                            return [_replace_nulls(x) for x in o]
+                        return o
+                    clean_row[col] = json.dumps(_replace_nulls(parsed), ensure_ascii=False)
+                except Exception:
+                    clean_row[col] = s
+            elif s.lower() in ("null", "none", "nan"):
+                clean_row[col] = ""
+            else:
+                clean_row[col] = s
+        else:
+            s = str(val).strip()
+            clean_row[col] = "" if s.lower() in ("null", "none", "nan") else s
+    return clean_row
 
 
 def extract_record_row(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -465,7 +523,7 @@ def extract_record_row(event: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(rendering_info, dict):
         message = extract_scalar_value(rendering_info.get("Message", ""))
 
-    return {
+    raw_row = {
         "RecordID": raw_rec_id,
         "TimeCreated": time_created,
         "EventID": event_id,
@@ -490,6 +548,7 @@ def extract_record_row(event: Dict[str, Any]) -> Dict[str, Any]:
         "UserData": user_data_str,
         "Message": message,
     }
+    return sanitize_record_row(raw_row)
 
 
 # ==============================================================================
@@ -640,31 +699,33 @@ def parse_evtx_python(evtx_path: str, output_csv_path: str) -> int:
                         message = msg_elem.text.strip()
 
                 extracted_rows.append(
-                    {
-                        "RecordID": rec_id,
-                        "TimeCreated": time_created,
-                        "EventID": event_id,
-                        "Level": level,
-                        "LevelName": level_name,
-                        "Channel": channel,
-                        "Provider": provider,
-                        "ProviderGuid": provider_guid,
-                        "EventSourceName": event_source,
-                        "Task": task,
-                        "Opcode": opcode,
-                        "Keywords": keywords,
-                        "Computer": computer,
-                        "UserID": user_id,
-                        "ProcessID": process_id,
-                        "ThreadID": thread_id,
-                        "Version": version,
-                        "ActivityID": activity_id,
-                        "RelatedActivityID": rel_activity_id,
-                        "Qualifiers": qualifiers,
-                        "EventData": event_data_str,
-                        "UserData": user_data_str,
-                        "Message": message,
-                    }
+                    sanitize_record_row(
+                        {
+                            "RecordID": rec_id,
+                            "TimeCreated": time_created,
+                            "EventID": event_id,
+                            "Level": level,
+                            "LevelName": level_name,
+                            "Channel": channel,
+                            "Provider": provider,
+                            "ProviderGuid": provider_guid,
+                            "EventSourceName": event_source,
+                            "Task": task,
+                            "Opcode": opcode,
+                            "Keywords": keywords,
+                            "Computer": computer,
+                            "UserID": user_id,
+                            "ProcessID": process_id,
+                            "ThreadID": thread_id,
+                            "Version": version,
+                            "ActivityID": activity_id,
+                            "RelatedActivityID": rel_activity_id,
+                            "Qualifiers": qualifiers,
+                            "EventData": event_data_str,
+                            "UserData": user_data_str,
+                            "Message": message,
+                        }
+                    )
                 )
             except Exception:
                 continue
@@ -680,10 +741,10 @@ def parse_evtx_python(evtx_path: str, output_csv_path: str) -> int:
     extracted_rows.sort(key=_sort_key)
 
     with open(output_csv_path, "w", newline="", encoding="utf-8") as f_out:
-        writer = csv.DictWriter(f_out, fieldnames=CSV_COLUMNS)
+        writer = csv.DictWriter(f_out, fieldnames=CSV_COLUMNS, restval="")
         writer.writeheader()
         for row in extracted_rows:
-            writer.writerow(row)
+            writer.writerow(sanitize_record_row(row))
 
     return len(extracted_rows)
 
@@ -805,10 +866,10 @@ def parse_evtx_to_csv(
     extracted_rows.sort(key=_sort_key)
 
     with open(clean_out, "w", newline="", encoding="utf-8") as f_out:
-        writer = csv.DictWriter(f_out, fieldnames=CSV_COLUMNS)
+        writer = csv.DictWriter(f_out, fieldnames=CSV_COLUMNS, restval="")
         writer.writeheader()
         for row in extracted_rows:
-            writer.writerow(row)
+            writer.writerow(sanitize_record_row(row))
 
     return {
         "success": True,
@@ -1005,8 +1066,9 @@ def convert_and_load(
         df = pd.DataFrame(columns=CSV_COLUMNS)
     else:
         try:
-            df = pd.read_csv(out_csv, dtype=str)
+            df = pd.read_csv(out_csv, dtype=str, keep_default_na=False)
             df.fillna("", inplace=True)
+            df.replace({"null": "", "None": "", "NULL": "", "NaN": "", "nan": ""}, inplace=True)
             for col in CSV_COLUMNS:
                 if col not in df.columns:
                     df[col] = ""
