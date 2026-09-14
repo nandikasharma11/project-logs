@@ -5,5 +5,3 @@ secondaryBackgroundColor = "#F8FAFC"
 textColor = "#1E293B"
 font = "Proxima Nova"
 
-[server]
-maxUploadSize = 1000
