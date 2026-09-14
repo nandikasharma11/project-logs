@@ -17,7 +17,7 @@ import re
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 import plotly.express as px
@@ -188,6 +188,28 @@ st.markdown(
         color: #1E88E5 !important;
         border-bottom-color: #1E88E5 !important;
     }
+
+    /* Chatbot Message Styling */
+    div[data-testid="stChatMessage"] {
+        border-radius: 12px !important;
+        padding: 14px 18px !important;
+        margin-bottom: 12px !important;
+        border: 1px solid rgba(30, 136, 229, 0.12) !important;
+        transition: all 0.2s ease-in-out !important;
+    }
+    div[data-testid="stChatMessage"]:hover {
+        border-color: rgba(30, 136, 229, 0.3) !important;
+    }
+    div[data-testid="stChatMessage"][data-testid*="user"] {
+        background-color: rgba(30, 136, 229, 0.05) !important;
+    }
+    div[data-testid="stChatMessage"][data-testid*="assistant"] {
+        background-color: #FFFFFF !important;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.03) !important;
+    }
+    div[data-testid="stChatInput"] {
+        border-radius: 10px !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -206,6 +228,16 @@ if "viewer_folder" not in st.session_state:
     st.session_state["viewer_folder"] = "Converted files"
 if "conversion_history" not in st.session_state:
     st.session_state["conversion_history"] = []
+if "chatbot_messages" not in st.session_state:
+    st.session_state["chatbot_messages"] = [
+        {
+            "role": "assistant",
+            "content": "👋 **Forensic AI Assistant online.**",
+            "evidence": None,
+        }
+    ]
+if "quick_prompt_input" not in st.session_state:
+    st.session_state["quick_prompt_input"] = None
 
 
 def clean_event_id_scalar(val: Any) -> str:
@@ -235,21 +267,207 @@ def load_csv_data(filepath: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def analyze_forensic_query(
+    query: str,
+    df: pd.DataFrame,
+    source_label: str,
+) -> Tuple[str, Optional[pd.DataFrame]]:
+    """Analyzes a natural language security query against an event log dataframe.
+
+    Returns: (markdown_response, matched_dataframe_or_None)
+    """
+    if df.empty:
+        return (
+            f"⚠️ **No records found in active scope (`{source_label}`).** "
+            "Please ensure you have converted `.evtx` logs in the **Converter** tab first.",
+            None,
+        )
+
+    q = query.lower().strip()
+
+    # Column mappings
+    ev_col = "EventID" if "EventID" in df.columns else None
+    msg_col = "Message" if "Message" in df.columns else None
+    ed_col = "EventData" if "EventData" in df.columns else None
+    comp_col = "Computer" if "Computer" in df.columns else None
+    chan_col = "Channel" if "Channel" in df.columns else None
+    time_col = "TimeCreated" if "TimeCreated" in df.columns else None
+    lvl_col = "LevelName" if "LevelName" in df.columns else ("Level" if "Level" in df.columns else None)
+
+    target_event_ids: List[str] = []
+    mitre_tactics: List[str] = []
+    technique_name = ""
+    threat_level = "Informational"
+
+    # Brute Force / Failed Logon
+    if any(term in q for term in ["failed logon", "fail", "bad password", "brute force", "4625", "auth fail", "logon error"]):
+        target_event_ids.extend(["4625", "4740", "4776"])
+        mitre_tactics.append("Credential Access (TA0006) - T1110: Brute Force")
+        technique_name = "Authentication Failure & Password Spray Analysis"
+        threat_level = "High"
+
+    # Privilege Escalation / Sensitive Privileges
+    elif any(term in q for term in ["privilege", "escalation", "admin", "4672", "special privilege", "token", "seimpersonate"]):
+        target_event_ids.extend(["4672", "4673", "4674"])
+        mitre_tactics.append("Privilege Escalation (TA0004) - T1078.002: Domain/Local Admin Privileges")
+        technique_name = "Special Privilege Assignment & Token Analysis"
+        threat_level = "Medium"
+
+    # Successful Logons
+    elif any(term in q for term in ["successful logon", "valid logon", "logon type", "4624"]):
+        target_event_ids.append("4624")
+        mitre_tactics.append("Initial Access / Lateral Movement (TA0008) - T1078: Valid Accounts")
+        technique_name = "Successful User Authentication Trace"
+        threat_level = "Informational"
+
+    # Process Creation / Execution
+    elif any(term in q for term in ["process", "powershell", "cmd", "execution", "command", "4688", "4104"]):
+        target_event_ids.extend(["4688", "4104", "4103", "1"])
+        mitre_tactics.append("Execution (TA0002) - T1059: Command and Scripting Interpreter")
+        technique_name = "Process Creation & Script Execution Audit"
+        threat_level = "Medium"
+
+    # Service Installation / Persistence
+    elif any(term in q for term in ["service", "persistence", "7045", "4697", "installed"]):
+        target_event_ids.extend(["7045", "4697"])
+        mitre_tactics.append("Persistence (TA0003) - T1543.003: Windows Service Creation")
+        technique_name = "New Service Creation / Persistence Artifacts"
+        threat_level = "High"
+
+    # Audit Log Cleared / Anti-Forensics
+    elif any(term in q for term in ["clear", "cleared", "tamper", "audit log", "1102", "104", "evasion"]):
+        target_event_ids.extend(["1102", "104"])
+        mitre_tactics.append("Defense Evasion (TA0005) - T1070.001: Clear Windows Event Logs")
+        technique_name = "Event Log Deletion & Defense Evasion"
+        threat_level = "Critical"
+
+    # Account Management
+    elif any(term in q for term in ["user create", "account create", "password reset", "lockout", "4720", "4724", "4740", "group"]):
+        target_event_ids.extend(["4720", "4722", "4724", "4728", "4738", "4740"])
+        mitre_tactics.append("Persistence / Impact - T1136: Create Account")
+        technique_name = "Account Management & Modification Tracking"
+        threat_level = "Medium"
+
+    # Explicit numeric Event ID detection from query
+    explicit_ids = re.findall(r"\b\d{4}\b", q)
+    if explicit_ids:
+        target_event_ids.extend(explicit_ids)
+
+    # Filter dataframe
+    matched_df = pd.DataFrame()
+    if target_event_ids and ev_col:
+        matched_df = df[df[ev_col].isin(target_event_ids)]
+
+    # If no event ID matches or user asked freeform query, search text across columns
+    if matched_df.empty:
+        ips = re.findall(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b", q)
+        hex_codes = re.findall(r"0x[0-9a-fA-F]+", q)
+        search_terms = ips + hex_codes
+
+        if not search_terms:
+            stop_words = {"show", "find", "were", "what", "when", "where", "from", "with", "have", "been", "that", "this", "events", "logs"}
+            search_terms = [w for w in re.findall(r"\b[a-zA-Z0-9_\-\.]{4,}\b", q) if w.lower() not in stop_words]
+
+        if search_terms:
+            mask = pd.Series(False, index=df.index)
+            for term in search_terms[:5]:
+                for c in [msg_col, ed_col, comp_col, chan_col]:
+                    if c and c in df.columns:
+                        mask = mask | df[c].astype(str).str.contains(term, case=False, na=False)
+            matched_df = df[mask]
+        else:
+            if "error" in q and lvl_col:
+                matched_df = df[df[lvl_col].astype(str).str.contains("Error|Critical", case=False, na=False)]
+            elif "warning" in q and lvl_col:
+                matched_df = df[df[lvl_col].astype(str).str.contains("Warning", case=False, na=False)]
+            else:
+                matched_df = df.head(50)
+
+    match_count = len(matched_df)
+    total_records = len(df)
+
+    if match_count == 0:
+        return (
+            f"### 🔍 Investigation Query: *\"{query}\"*\n\n"
+            f"**Scope Analyzed:** `{source_label}` ({total_records:,} total records)\n\n"
+            f"❌ **No matching events found** for this query in the selected log scope.",
+            None,
+        )
+
+    # Summary metrics
+    time_min = matched_df[time_col].min() if time_col and not matched_df[time_col].empty else "N/A"
+    time_max = matched_df[time_col].max() if time_col and not matched_df[time_col].empty else "N/A"
+    hosts = [str(h) for h in matched_df[comp_col].dropna().unique() if str(h).strip()] if comp_col else []
+    host_summary = ", ".join(hosts[:3]) + (f" (+{len(hosts)-3} more)" if len(hosts) > 3 else "") if hosts else "N/A"
+
+    # Extract user mentions
+    user_counts: Dict[str, int] = {}
+    if ed_col:
+        for val in matched_df[ed_col].dropna():
+            if "UserName" in val or "User" in val:
+                m_user = re.search(r'["\'](?:TargetUserName|SubjectUserName|UserName)["\']\s*:\s*["\']([^"\']+)["\']', str(val))
+                if m_user:
+                    u = m_user.group(1)
+                    if u not in ("-", "SYSTEM"):
+                        user_counts[u] = user_counts.get(u, 0) + 1
+
+    top_users_str = ", ".join(f"`{u}` ({cnt})" for u, cnt in sorted(user_counts.items(), key=lambda x: x[1], reverse=True)[:4]) if user_counts else "N/A"
+
+    response = (
+        f"### 🛡️ Forensic Investigation Analysis\n\n"
+        f"**Query:** *\"{query}\"*\n\n"
+        f"**Target Scope:** `{source_label}` | **Threat Level:** `{threat_level}`\n\n"
+        f"---\n\n"
+        f"#### 📊 Key Findings & Evidence Metrics\n"
+        f"- **Matched Security Events:** **{match_count:,}** record(s) out of {total_records:,} ({(match_count/total_records)*100:.2f}% of log)\n"
+        f"- **Timeline Range:** `{time_min}` $\\rightarrow$ `{time_max}`\n"
+        f"- **Affected System(s):** `{host_summary}`\n"
+        f"- **Primary Account(s) Identified:** {top_users_str}\n\n"
+    )
+
+    if mitre_tactics:
+        response += (
+            f"#### 🎯 MITRE ATT&CK Classification\n"
+            f"- **Focus Domain:** {technique_name}\n"
+        )
+        for tactic in mitre_tactics:
+            response += f"- **Technique:** `{tactic}`\n"
+        response += "\n"
+
+    response += (
+        f"#### 🔎 Tactical Guidance & Next Steps\n"
+        f"1. **Temporal Correlation:** Examine companion logs around `{time_min}` for concurrent anomalous activity.\n"
+        f"2. **Identity Verification:** Confirm whether `{top_users_str.split('`')[1] if '`' in top_users_str else 'the identified user'}` was authorized for this action.\n"
+        f"3. **Artifact Review:** Detailed matching records are provided below in the Evidence Artifacts inspector."
+    )
+
+    return response, matched_df
+
+
 # ------------------------------------------------------------------------------
 # SIDEBAR: NAVIGATION & CONTROLS
 # ------------------------------------------------------------------------------
 
 st.sidebar.title("Windows Logs")
 st.sidebar.subheader("Navigation")
+
+current_nav_idx = 0
+if st.session_state.get("active_tab") == "viewer":
+    current_nav_idx = 1
+elif st.session_state.get("active_tab") == "chatbot":
+    current_nav_idx = 2
+
 page_selection = st.sidebar.radio(
     "Choose Mode:",
-    options=["🔄 Convert EVTX to CSV", "📊 Log Viewer & Inspector"],
-    index=0 if st.session_state["active_tab"] == "converter" else 1,
+    options=["🔄 Convert EVTX to CSV", "📊 Log Viewer & Inspector", "🤖 Forensic AI Chatbot"],
+    index=current_nav_idx,
 )
 if page_selection == "🔄 Convert EVTX to CSV":
     st.session_state["active_tab"] = "converter"
-else:
+elif page_selection == "📊 Log Viewer & Inspector":
     st.session_state["active_tab"] = "viewer"
+else:
+    st.session_state["active_tab"] = "chatbot"
 
 
 # ==============================================================================
@@ -760,3 +978,148 @@ elif st.session_state["active_tab"] == "viewer":
                         st.info("No EventData or UserData payload attached to this record.")
             else:
                 st.info("No records match the current filter criteria.")
+
+
+# ==============================================================================
+# VIEW 3: FORENSIC AI CHATBOT
+# ==============================================================================
+
+elif st.session_state["active_tab"] == "chatbot":
+    st.title("🤖 Windows Forensic AI Investigation Assistant")
+    st.markdown(
+        "Interactive natural language threat hunter and DFIR log analyst. "
+        "Ask questions across your converted logs to correlate events, detect anomalies, "
+        "and inspect raw forensic artifacts."
+    )
+
+    # 1. Discover available logs
+    csv_dir = st.session_state.get("viewer_folder", "Converted files")
+    norm_csv_dir = normalize_path(csv_dir)
+    available_csvs = sorted(glob.glob(os.path.join(norm_csv_dir, "*.csv"))) if os.path.isdir(norm_csv_dir) else []
+
+    if not available_csvs:
+        st.warning(
+            f"⚠️ No converted `.csv` log files found in `{csv_dir}`. "
+            "Please convert `.evtx` files in the **Converter** tab before starting an investigation."
+        )
+        if st.button("🔄 Go to EVTX Converter", type="primary"):
+            st.session_state["active_tab"] = "converter"
+            st.rerun()
+    else:
+        # Scope Selection
+        csv_options = {os.path.basename(f): f for f in available_csvs}
+        log_names = list(csv_options.keys())
+
+        # Determine default log selection
+        default_choice = log_names[0]
+        if st.session_state.get("last_converted_csv"):
+            last_base = os.path.basename(st.session_state["last_converted_csv"])
+            if last_base in log_names:
+                default_choice = last_base
+
+        # Sidebar Chatbot Controls
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("Investigation Scope")
+        selected_log_name = st.sidebar.selectbox(
+            "Target Log File:",
+            options=["All Converted Logs (Consolidated)"] + log_names,
+            index=0 if len(log_names) > 1 else 1,
+            help="Choose an individual log file or query across all converted logs simultaneously.",
+        )
+
+        # Clear Chat Button
+        if st.sidebar.button("🗑️ Clear Chat History", use_container_width=True):
+            st.session_state["chatbot_messages"] = [
+                {
+                    "role": "assistant",
+                    "content": "🧹 **Investigation history cleared.** Ready for a new query.",
+                    "evidence": None,
+                }
+            ]
+            st.rerun()
+
+        # Load data based on selected scope
+        with st.spinner("Loading log data into investigation workspace..."):
+            if selected_log_name == "All Converted Logs (Consolidated)":
+                dfs = []
+                for fn, fp in csv_options.items():
+                    temp_df = load_csv_data(fp)
+                    if not temp_df.empty:
+                        temp_df["SourceLog"] = fn
+                        dfs.append(temp_df)
+                active_df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+                scope_label = f"All Logs ({len(dfs)} files)"
+            else:
+                active_df = load_csv_data(csv_options[selected_log_name])
+                scope_label = selected_log_name
+
+        # KPI Metrics Cards
+        kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
+        with kpi_col1:
+            st.metric("Investigation Scope", scope_label[:20] + ("..." if len(scope_label) > 20 else ""))
+        with kpi_col2:
+            st.metric("Records Analyzed", f"{len(active_df):,}")
+        with kpi_col3:
+            unique_ids = active_df["EventID"].nunique() if "EventID" in active_df.columns else 0
+            st.metric("Unique Event IDs", f"{unique_ids:,}")
+        with kpi_col4:
+            st.metric("Analyst Status", "🟢 Ready")
+
+        st.markdown("---")
+
+        # Chat History Display
+        for idx, msg in enumerate(st.session_state["chatbot_messages"]):
+            avatar_icon = "🧑‍💻" if msg["role"] == "user" else "🤖"
+            with st.chat_message(msg["role"], avatar=avatar_icon):
+                st.markdown(msg["content"])
+
+                # If this message has evidence attached, render the evidence inspector
+                ev_df = msg.get("evidence")
+                if ev_df is not None and not ev_df.empty:
+                    with st.expander(f"🔎 Evidence Artifacts ({len(ev_df):,} matching events)", expanded=False):
+                        preview_cols = [
+                            c for c in ["TimeCreated", "EventID", "LevelName", "Channel", "Computer", "UserID", "Message"]
+                            if c in ev_df.columns
+                        ]
+                        if not preview_cols:
+                            preview_cols = list(ev_df.columns[:6])
+
+                        st.dataframe(ev_df[preview_cols].head(250), use_container_width=True)
+
+                        # Download matched evidence
+                        csv_evidence = ev_df.to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            label="📥 Download Evidence as CSV",
+                            data=csv_evidence,
+                            file_name=f"forensic_evidence_{idx}.csv",
+                            mime="text/csv",
+                            key=f"btn_dl_ev_{idx}",
+                        )
+
+        # User Chat Input
+        user_query = st.chat_input("Ask a forensic question about the logs...")
+
+        # Process query if submitted
+        if user_query:
+            # Append user message
+            st.session_state["chatbot_messages"].append(
+                {"role": "user", "content": user_query, "evidence": None}
+            )
+
+            # Analyze query against active dataset
+            with st.spinner("Analyzing event records and correlating artifacts..."):
+                resp_text, matched_evidence = analyze_forensic_query(
+                    query=user_query,
+                    df=active_df,
+                    source_label=scope_label,
+                )
+
+            # Append assistant response
+            st.session_state["chatbot_messages"].append(
+                {
+                    "role": "assistant",
+                    "content": resp_text,
+                    "evidence": matched_evidence,
+                }
+            )
+            st.rerun()
