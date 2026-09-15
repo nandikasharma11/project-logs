@@ -850,7 +850,7 @@ elif st.session_state["active_tab"] == "viewer":
                 with flt_r1c1:
                     filter_keyword = st.text_input(
                         "Keyword Search:",
-                        placeholder="Search EventData, UserData, Message, or UserID...",
+                        placeholder="Search across EventData, Message, Provider, Computer, UserID...",
                         key="flt_keyword",
                     )
                 with flt_r1c2:
@@ -889,9 +889,22 @@ elif st.session_state["active_tab"] == "viewer":
             if filter_keyword:
                 kw = filter_keyword.strip().lower()
                 mask = pd.Series(False, index=filtered_df.index)
-                for col in ["_summary_cached", "EventData", "UserData", "Message", "Computer", "UserID"]:
+                search_columns = [
+                    "_summary_cached",
+                    "EventData",
+                    "UserData",
+                    "Message",
+                    "Provider",
+                    "Channel",
+                    "Computer",
+                    "UserID",
+                    "EventID",
+                    "Task",
+                    "RecordID",
+                ]
+                for col in search_columns:
                     if col in filtered_df.columns:
-                        mask = mask | filtered_df[col].astype(str).str.lower().str.contains(kw, na=False)
+                        mask = mask | filtered_df[col].astype(str).str.lower().str.contains(kw, regex=False, na=False)
                 filtered_df = filtered_df[mask]
 
             if sel_eids:
