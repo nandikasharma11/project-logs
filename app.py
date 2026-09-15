@@ -6,7 +6,7 @@ Built with Streamlit and powered by fileconversion.py.
 Features:
 - Dual-Engine Support: Native evtx_dump binary + pure-Python fallback.
 - Multi-Format Export: Convert EVTX to CSV, JSON, JSON Lines (JSONL), or standard Windows XML.
-- Forensic Grid: Identical columns to evtxparser (Record #, Time, Level, Event ID, Name, Provider, Channel, Computer, Summary).
+- Forensic Grid: Essential forensic columns (Record #, Time, Level, Event ID, Name, Provider, Channel, Computer, Action) with inline EVENT DATA drawer.
 - Inline Row Expansion ("EVENT DATA" Drawer): Inspect key-values, Show raw XML, and Show raw JSON.
 - Collapsible "▸ Advanced filters" Accordion: Filter by Event ID, Level, Provider, Channel, Computer, Time, and Keyword.
 - 1-Click Export Toolbar: Download current filtered records as CSV, JSON, or XML.
@@ -455,14 +455,6 @@ st.markdown(
         display: inline-block;
     }
 
-    /* Read More Summary Popover */
-    details.read-more-wrapper summary::-webkit-details-marker {
-        display: none !important;
-    }
-    details.read-more-wrapper summary {
-        list-style: none !important;
-        outline: none !important;
-    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1048,7 +1040,7 @@ elif st.session_state["active_tab"] == "viewer":
 
                 # --------------------------------------------------------------
                 # TABLE HEADER ROW (FLEXBOX SINGLE CONTAINER)
-                # Exact columns: Record # ↑ | Time (UTC) | Level | Event ID | Name | Provider | Channel | Computer | Summary | Action
+                # Exact columns: Record # ↑ | Time (UTC) | Level | Event ID | Name | Provider | Channel | Computer | Action
                 # --------------------------------------------------------------
                 sort_symbol = "↑" if sort_asc else "↓"
                 th_col_widths = [1.2, 1.8, 1.1, 1.1, 1.1, 2.2, 1.8, 1.8, 1.1]
