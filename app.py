@@ -128,15 +128,18 @@ def compute_event_summary(row: Any) -> str:
             pairs = []
             for k, v in unpacked.items():
                 val_s = str(v).strip().replace("\r", " ").replace("\n", " ")
+                val_s = re.sub(r"\s+", " ", val_s)
                 if val_s:
                     pairs.append(f"{k}={val_s}")
             if pairs:
-                return " ".join(pairs)
+                res = " ".join(pairs)
+                return re.sub(r"\s+", " ", res).strip()
 
     # 2. Message fallback
     msg = str(row.get("Message", "")).strip()
     if msg and msg.lower() not in ("", "none", "nan", "null"):
-        return msg.replace("\r", " ").replace("\n", " ")
+        res = msg.replace("\r", " ").replace("\n", " ")
+        return re.sub(r"\s+", " ", res).strip()
 
     # 3. UserData fallback
     ud_raw = str(row.get("UserData", "")).strip()
@@ -145,8 +148,9 @@ def compute_event_summary(row: Any) -> str:
         if unpacked_ud:
             pairs = [f"{k}={v}" for k, v in unpacked_ud.items() if str(v).strip()]
             if pairs:
-                return " ".join(pairs)
-        return ud_raw.replace("\r", " ").replace("\n", " ")
+                res = " ".join(pairs).replace("\r", " ").replace("\n", " ")
+                return re.sub(r"\s+", " ", res).strip()
+        return re.sub(r"\s+", " ", ud_raw.replace("\r", " ").replace("\n", " ")).strip()
 
     # 4. Task fallback
     task = str(row.get("Task", "")).strip()
@@ -265,6 +269,9 @@ st.markdown(
     /* Ensure every horizontal block is vertically centered */
     div[data-testid="stHorizontalBlock"] {
         align-items: center !important;
+        border-bottom: 1px solid #E2E8F0 !important;
+        padding-top: 1px !important;
+        padding-bottom: 1px !important;
     }
 
     /* Ensure each column has no top margin displacement */
@@ -273,11 +280,10 @@ st.markdown(
         align-items: center !important;
         justify-content: flex-start !important;
         min-height: 32px !important;
-        padding-top: 0 !important;
-        padding-bottom: 0 !important;
+        padding: 0 4px !important;
     }
 
-    /* Remove paragraph margins which caused 16px displacement */
+    /* Remove paragraph margins which caused vertical displacement */
     div[data-testid="stHorizontalBlock"] div[data-testid="stMarkdownContainer"] p {
         margin: 0 !important;
         padding: 0 !important;
@@ -285,6 +291,19 @@ st.markdown(
         white-space: nowrap !important;
         overflow: hidden !important;
         text-overflow: ellipsis !important;
+    }
+
+    /* Summary column: allow popover overflow without clipping */
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:nth-child(9) {
+        overflow: visible !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:nth-child(9) div[data-testid="stMarkdownContainer"] {
+        overflow: visible !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:nth-child(9) div[data-testid="stMarkdownContainer"] p {
+        overflow: visible !important;
+        display: flex !important;
+        align-items: center !important;
     }
 
     /* Action button column: exact centering and compact 26px height */
@@ -315,7 +334,7 @@ st.markdown(
         font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace !important;
         font-size: 0.82rem !important;
         font-weight: 700 !important;
-        color: #0F172A !important; /* Deep dark slate - high contrast */
+        color: #0F172A !important;
         white-space: nowrap !important;
         overflow: hidden !important;
         text-overflow: ellipsis !important;
@@ -324,7 +343,7 @@ st.markdown(
     .cell-time {
         font-family: 'JetBrains Mono', Consolas, monospace !important;
         font-size: 0.80rem !important;
-        color: #1E293B !important; /* Dark slate 800 */
+        color: #1E293B !important;
         white-space: nowrap !important;
         overflow: hidden !important;
         text-overflow: ellipsis !important;
@@ -332,7 +351,7 @@ st.markdown(
     }
     .cell-text {
         font-size: 0.82rem !important;
-        color: #0F172A !important; /* Dark slate 900 */
+        color: #0F172A !important;
         white-space: nowrap !important;
         overflow: hidden !important;
         text-overflow: ellipsis !important;
@@ -340,12 +359,12 @@ st.markdown(
     }
     .cell-sum {
         font-family: 'JetBrains Mono', Consolas, monospace !important;
-        font-size: 0.80rem !important;
-        color: #334155 !important; /* Slate 700 */
+        font-size: 0.78rem !important;
+        color: #334155 !important;
         white-space: nowrap !important;
         overflow: hidden !important;
         text-overflow: ellipsis !important;
-        display: block !important;
+        display: inline-block !important;
     }
 
     /* SEVERITY PILL BADGES */
@@ -423,26 +442,27 @@ st.markdown(
         margin-bottom: 8px;
     }
     .forensic-payload-box {
-        background-color: #0F172A;
-        border: 1px solid #1E293B;
-        border-radius: 6px;
-        padding: 14px 18px;
-        font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
-        font-size: 0.82rem;
-        color: #F8FAFC;
-        line-height: 1.6;
-        margin-bottom: 12px;
-        word-break: break-word;
-        max-height: 260px;
-        overflow-y: auto;
+        background-color: #0F172A !important;
+        border: 1px solid #1E293B !important;
+        border-radius: 6px !important;
+        padding: 14px 18px !important;
+        font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace !important;
+        font-size: 0.80rem !important;
+        color: #F8FAFC !important;
+        line-height: 1.6 !important;
+        margin-bottom: 12px !important;
+        word-break: break-word !important;
+        max-height: 280px !important;
+        overflow-y: auto !important;
+        white-space: pre-wrap !important;
     }
     .forensic-payload-key {
-        color: #38BDF8;
-        font-weight: 700;
-        margin-right: 10px;
+        color: #38BDF8 !important;
+        font-weight: 700 !important;
+        margin-right: 10px !important;
     }
     .forensic-payload-val {
-        color: #F8FAFC;
+        color: #F8FAFC !important;
     }
 
     /* Filter indicator pill */
@@ -455,6 +475,15 @@ st.markdown(
         font-weight: 700;
         color: #1E88E5;
         display: inline-block;
+    }
+
+    /* Read More Summary Popover */
+    details.read-more-wrapper summary::-webkit-details-marker {
+        display: none !important;
+    }
+    details.read-more-wrapper summary {
+        list-style: none !important;
+        outline: none !important;
     }
     </style>
     """,
@@ -1115,8 +1144,30 @@ elif st.session_state["active_tab"] == "viewer":
                         st.markdown(f"<span class='cell-text' title='{html.escape(chan_val)}'>{html.escape(chan_val)}</span>", unsafe_allow_html=True)
                     with c_comp:
                         st.markdown(f"<span class='cell-mono' title='{html.escape(comp_val)}'>{html.escape(comp_val)}</span>", unsafe_allow_html=True)
+
+                    # Summary column with compact preview and 'read more..' expander
                     with c_sum:
-                        st.markdown(f"<span class='cell-sum' title='{html.escape(sum_val)}'>{html.escape(sum_val)}</span>", unsafe_allow_html=True)
+                        clean_sum = re.sub(r"\s+", " ", str(sum_val)).strip()
+                        CUTOFF = 60
+                        if len(clean_sum) <= CUTOFF:
+                            safe_sum = html.escape(clean_sum).replace("`", "&#96;")
+                            st.markdown(f"<span class='cell-sum' title='{safe_sum}'>{safe_sum}</span>", unsafe_allow_html=True)
+                        else:
+                            snippet = html.escape(clean_sum[:CUTOFF]).replace("`", "&#96;")
+                            full_safe = html.escape(clean_sum).replace("`", "&#96;").replace("*", "&#42;").replace("_", "&#95;")
+                            details_html = f"""
+                            <div style="display: flex; align-items: center; gap: 6px; width: 100%; font-family: 'JetBrains Mono', Consolas, monospace;">
+                                <span class="cell-sum" title="{full_safe}" style="max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block;">{snippet}...</span>
+                                <details class="read-more-wrapper" style="display: inline-block; position: relative;">
+                                    <summary style="cursor: pointer; color: #1E88E5; font-size: 0.74rem; font-weight: 700; white-space: nowrap; text-decoration: underline;">read more..</summary>
+                                    <div style="position: absolute; right: 0; top: 22px; z-index: 9999; width: 440px; max-height: 180px; overflow-y: auto; background: #FFFFFF; border: 1px solid #94A3B8; border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.18); padding: 10px 12px; font-size: 0.76rem; color: #0F172A; white-space: pre-wrap; word-break: break-word; line-height: 1.5;">
+                                        <div style="font-weight: 800; color: #1E88E5; font-size: 0.72rem; text-transform: uppercase; margin-bottom: 4px;">Full Summary:</div>
+                                        {full_safe}
+                                    </div>
+                                </details>
+                            </div>
+                            """
+                            st.markdown(details_html, unsafe_allow_html=True)
 
                     with c_act:
                         if is_expanded:
@@ -1141,11 +1192,20 @@ elif st.session_state["active_tab"] == "viewer":
                         if unpacked_ed:
                             for pk, pv in unpacked_ed.items():
                                 val_clean = str(pv).strip().replace("\r\n", "\n")
-                                payload_lines.append(f"<div style='margin-bottom: 6px;'><span class='forensic-payload-key'>{html.escape(pk)}</span> <span class='forensic-payload-val'>{html.escape(val_clean)}</span></div>")
+                                safe_pk = html.escape(str(pk)).replace("`", "&#96;")
+                                # Escape markdown special chars so stack traces never parse as code blocks/lists
+                                safe_pv = html.escape(val_clean).replace("`", "&#96;").replace("*", "&#42;").replace("_", "&#95;")
+                                payload_lines.append(
+                                    f"<div style='margin-bottom: 8px;'>"
+                                    f"<span class='forensic-payload-key'>{safe_pk}</span> "
+                                    f"<span class='forensic-payload-val' style='font-family: inherit; color: #F8FAFC;'>{safe_pv}</span>"
+                                    f"</div>"
+                                )
                         else:
                             msg_clean = str(row.get("Message", "")).strip()
                             if msg_clean:
-                                payload_lines.append(f"<span class='forensic-payload-val'>{html.escape(msg_clean)}</span>")
+                                safe_msg = html.escape(msg_clean).replace("`", "&#96;").replace("*", "&#42;").replace("_", "&#95;")
+                                payload_lines.append(f"<span class='forensic-payload-val' style='color: #F8FAFC;'>{safe_msg}</span>")
                             else:
                                 payload_lines.append("<span style='color: #94A3B8;'>No EventData or payload parameters attached to this record.</span>")
 
