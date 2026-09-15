@@ -1,29 +1,33 @@
 """app.py
 ======
-Windows EVTX to CSV Converter & Interactive Log Viewer GUI.
+Windows EVTX Forensic Log Converter & Interactive Inspector GUI.
 
 Built with Streamlit and powered by fileconversion.py.
 Features:
-- Unrestricted Source: Upload files via browser, or enter any system path/wildcard.
-- Unrestricted Destination: Save CSVs to any folder or explicit filename anywhere on disk.
 - Dual-Engine Support: Native evtx_dump binary + pure-Python fallback.
-- Interactive Log Viewer: Search, filter, inspect JSON payloads, and view charts.
+- Multi-Format Export: Convert EVTX to CSV, JSON, JSON Lines (JSONL), or standard Windows XML.
+- Forensic Grid: Identical columns to evtxparser (Record #, Time, Level, Event ID, Name, Provider, Channel, Computer, Summary).
+- Inline Row Expansion ("EVENT DATA" Drawer): Inspect key-values, Show raw XML, and Show raw JSON.
+- Collapsible "▸ Advanced filters" Accordion: Filter by Event ID, Level, Provider, Channel, Computer, Time, and Keyword.
+- 1-Click Export Toolbar: Download current filtered records as CSV, JSON, or XML.
 """
 
 import glob
+import html
+import importlib
 import json
 import os
 import re
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-import importlib
 import fileconversion
 
 try:
@@ -35,6 +39,9 @@ convert = getattr(fileconversion, "convert")
 convert_and_load = getattr(fileconversion, "convert_and_load")
 convert_from_path = getattr(fileconversion, "convert_from_path")
 convert_from_upload = getattr(fileconversion, "convert_from_upload")
+record_to_xml = getattr(fileconversion, "record_to_xml")
+records_to_xml = getattr(fileconversion, "records_to_xml")
+CSV_COLUMNS = getattr(fileconversion, "CSV_COLUMNS")
 
 
 def normalize_path(p: Optional[str]) -> str:
@@ -57,22 +64,114 @@ def find_source_files(src: str, selected_files: Optional[List[str]] = None, recu
 
 
 # ------------------------------------------------------------------------------
-# STREAMLIT CONFIGURATION & STYLING (BLUE THEME)
+# FORMATTING & EXTRACTION HELPERS
+# ------------------------------------------------------------------------------
+
+def format_time_utc(ts_str: Any) -> str:
+    """Formats ISO-8601 timestamp string to standard 'M/D/YY, H:MM:SS AM/PM'."""
+    if not ts_str:
+        return "-"
+    try:
+        s = str(ts_str).rstrip("Z").replace("T", " ").strip()
+        if "." in s:
+            s_main, s_micro = s.split(".", 1)
+            s = f"{s_main}.{s_micro[:6]}"
+            dt = datetime.fromisoformat(s)
+        else:
+            dt = datetime.fromisoformat(s)
+        hour = dt.hour % 12 or 12
+        ampm = "AM" if dt.hour < 12 else "PM"
+        return f"{dt.month}/{dt.day}/{dt.year % 100}, {hour}:{dt.minute:02d}:{dt.second:02d} {ampm}"
+    except Exception:
+        return str(ts_str)
+
+
+def unpack_event_data_dict(ed_raw: Any) -> Dict[str, Any]:
+    """Extracts structured key-values from raw EventData or UserData strings."""
+    if not ed_raw or str(ed_raw).strip().lower() in ("", "none", "nan", "null", "{}"):
+        return {}
+    s = str(ed_raw).strip()
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, dict):
+            clean = {}
+            for idx, (k, v) in enumerate(parsed.items(), 1):
+                if isinstance(v, dict) and "Value" in v:
+                    clean[k] = v["Value"]
+                else:
+                    clean[k] = v
+            return clean
+        elif isinstance(parsed, list):
+            return {f"Data{i+1}": x for i, x in enumerate(parsed)}
+    except Exception:
+        pass
+    return {"Data1": s}
+
+
+def compute_event_summary(row: Any) -> str:
+    """Computes a concise, single-line summary string for the Forensic Grid (e.g. Data1=Category: ...)."""
+    # 1. EventData parsing
+    ed_raw = str(row.get("EventData", "")).strip()
+    if ed_raw and ed_raw.lower() not in ("", "none", "nan", "null", "{}"):
+        unpacked = unpack_event_data_dict(ed_raw)
+        if unpacked:
+            pairs = []
+            for k, v in unpacked.items():
+                val_s = str(v).strip().replace("\r", " ").replace("\n", " ")
+                if val_s:
+                    pairs.append(f"{k}={val_s}")
+            if pairs:
+                return " ".join(pairs)
+
+    # 2. Message fallback
+    msg = str(row.get("Message", "")).strip()
+    if msg and msg.lower() not in ("", "none", "nan", "null"):
+        return msg.replace("\r", " ").replace("\n", " ")
+
+    # 3. UserData fallback
+    ud_raw = str(row.get("UserData", "")).strip()
+    if ud_raw and ud_raw.lower() not in ("", "none", "nan", "null", "{}"):
+        unpacked_ud = unpack_event_data_dict(ud_raw)
+        if unpacked_ud:
+            pairs = [f"{k}={v}" for k, v in unpacked_ud.items() if str(v).strip()]
+            if pairs:
+                return " ".join(pairs)
+        return ud_raw.replace("\r", " ").replace("\n", " ")
+
+    # 4. Task fallback
+    task = str(row.get("Task", "")).strip()
+    if task and task not in ("0", "", "none", "nan"):
+        return f"Task: {task}"
+
+    return "-"
+
+
+def clean_event_id_scalar(val: Any) -> str:
+    """Extracts clean numeric EventID if stored as a dictionary string (e.g. {'#text': 4624})."""
+    s = str(val).strip()
+    if "#text" in s:
+        m = re.search(r"['\"]?#text['\"]?\s*:\s*['\"]?(\d+)['\"]?", s)
+        if m:
+            return m.group(1)
+    return s
+
+
+# ------------------------------------------------------------------------------
+# STREAMLIT CONFIGURATION & STYLING (FORENSIC BLUE & CYBER PALETTE)
 # ------------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Windows EVTX Log Converter & Viewer",
+    page_title="Windows EVTX Forensic Log Converter & Inspector",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS for blue theme across all components
 st.markdown(
     """
     <style>
-    /* Metric card styling */
+    /* Metric Card Styling */
     div[data-testid="metric-container"] {
-        background-color: rgba(30, 136, 229, 0.07);
+        background-color: rgba(30, 136, 229, 0.06);
         border: 1px solid rgba(30, 136, 229, 0.22);
         padding: 12px 18px;
         border-radius: 10px;
@@ -83,12 +182,6 @@ st.markdown(
         background-color: rgba(30, 136, 229, 0.12);
     }
 
-    /* Table overflow */
-    .stDataFrame {
-        border-radius: 8px;
-        overflow: hidden;
-    }
-
     /* Primary Buttons -> Blue */
     button[kind="primary"],
     div[data-testid="stButton"] > button[kind="primary"],
@@ -97,96 +190,192 @@ st.markdown(
         background-color: #1E88E5 !important;
         border-color: #1976D2 !important;
         color: #FFFFFF !important;
-        box-shadow: 0 4px 14px rgba(30, 136, 229, 0.3) !important;
-        border-radius: 8px !important;
+        box-shadow: 0 4px 14px rgba(30, 136, 229, 0.25) !important;
+        border-radius: 6px !important;
         font-weight: 600 !important;
     }
     button[kind="primary"]:hover,
     div[data-testid="stButton"] > button[kind="primary"]:hover,
-    .stButton > button[type="primary"]:hover,
-    button[data-testid="baseButton-primary"]:hover {
+    .stButton > button[type="primary"]:hover {
         background-color: #1976D2 !important;
         border-color: #1565C0 !important;
         color: #FFFFFF !important;
-        box-shadow: 0 6px 18px rgba(30, 136, 229, 0.45) !important;
-    }
-    button[kind="primary"]:active,
-    div[data-testid="stButton"] > button[kind="primary"]:active,
-    button[data-testid="baseButton-primary"]:active {
-        background-color: #1565C0 !important;
-        border-color: #0D47A1 !important;
+        box-shadow: 0 6px 18px rgba(30, 136, 229, 0.40) !important;
     }
 
-    /* Radio Buttons -> Blue */
-    div[data-testid="stRadio"] div[role="radiogroup"] label[data-checked="true"] div:first-child,
-    div[data-testid="stRadio"] [role="radiogroup"] label[data-checked="true"] span:first-child {
-        border-color: #1E88E5 !important;
-        background-color: #1E88E5 !important;
+    /* Secondary / Action Buttons */
+    .stButton > button {
+        border-radius: 6px !important;
+        font-size: 0.85rem !important;
+        transition: all 0.15s ease-in-out;
     }
-    div[data-testid="stRadio"] svg {
-        fill: #1E88E5 !important;
+
+    /* Compact Grid Row Buttons */
+    div.forensic-row-container div[data-testid="stButton"] button {
+        padding: 3px 8px !important;
+        min-height: 28px !important;
+        font-size: 0.78rem !important;
+        font-weight: 600 !important;
+        width: 100% !important;
     }
+
+    /* Radio Buttons & Inputs */
     div[data-testid="stRadio"] [role="radiogroup"] label[data-checked="true"] p {
         color: #1E88E5 !important;
         font-weight: 600 !important;
     }
-
-    /* Progress bar -> Blue */
-    div[data-testid="stProgress"] > div > div > div > div {
-        background-color: #1E88E5 !important;
-    }
-
-    /* File Uploader -> Blue Accents */
-    div[data-testid="stFileUploader"] section[data-testid="stFileUploadDropzone"] {
-        border-color: rgba(30, 136, 229, 0.35) !important;
-        background-color: rgba(30, 136, 229, 0.03) !important;
-    }
-    div[data-testid="stFileUploader"] section[data-testid="stFileUploadDropzone"]:hover {
-        border-color: #1E88E5 !important;
-        background-color: rgba(30, 136, 229, 0.07) !important;
-    }
-    div[data-testid="stFileUploader"] button {
-        border-color: #1E88E5 !important;
-        color: #1E88E5 !important;
-    }
-    div[data-testid="stFileUploader"] button:hover {
-        background-color: rgba(30, 136, 229, 0.1) !important;
-        border-color: #1976D2 !important;
-        color: #1976D2 !important;
-    }
-
-    /* Download Buttons -> Blue Outline */
-    .stDownloadButton > button {
-        border-color: #1E88E5 !important;
-        color: #1E88E5 !important;
-    }
-    .stDownloadButton > button:hover {
-        background-color: rgba(30, 136, 229, 0.09) !important;
-        border-color: #1976D2 !important;
-        color: #1976D2 !important;
-    }
-
-    /* Inputs focus outline -> Blue */
     input:focus, textarea:focus, div[data-baseweb="input"]:focus-within {
         border-color: #1E88E5 !important;
         box-shadow: 0 0 0 1px #1E88E5 !important;
     }
 
-    /* Checkboxes -> Blue */
-    div[data-testid="stCheckbox"] input[type="checkbox"]:checked + span {
-        background-color: #1E88E5 !important;
-        border-color: #1E88E5 !important;
+    /* FORENSIC GRID STYLING */
+    .forensic-header-bar {
+        background-color: #0F172A;
+        border-top: 1px solid #334155;
+        border-bottom: 2px solid #1E88E5;
+        padding: 10px 8px;
+        margin-bottom: 6px;
+        border-radius: 6px 6px 0 0;
+    }
+    .forensic-th {
+        font-size: 0.80rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        color: #94A3B8;
+        text-transform: uppercase;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+    }
+    .forensic-th-highlight {
+        color: #F59E0B !important; /* Gold highlight for sorted column */
+        font-weight: 800;
     }
 
-    /* Multiselect / Tags */
-    div[data-baseweb="select"] span[data-baseweb="tag"] {
-        background-color: rgba(30, 136, 229, 0.15) !important;
+    .forensic-row {
+        padding: 6px 4px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+        align-items: center;
+        transition: background-color 0.15s ease-in-out;
+    }
+    .forensic-row:hover {
+        background-color: rgba(30, 136, 229, 0.05);
+    }
+    .forensic-row-expanded {
+        background-color: rgba(30, 136, 229, 0.10) !important;
+        border-left: 3px solid #1E88E5;
     }
 
-    /* Active Tab */
-    button[data-baseweb="tab"][aria-selected="true"] {
-        color: #1E88E5 !important;
-        border-bottom-color: #1E88E5 !important;
+    .forensic-cell-mono {
+        font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
+        font-size: 0.82rem;
+        color: #CBD5E1;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        line-height: 2.2;
+    }
+    .forensic-cell-text {
+        font-size: 0.82rem;
+        color: #E2E8F0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        line-height: 2.2;
+    }
+
+    /* Severity Badges */
+    .forensic-badge-error {
+        color: #EF4444;
+        font-weight: 700;
+        font-size: 0.82rem;
+        line-height: 2.2;
+    }
+    .forensic-badge-critical {
+        color: #DC2626;
+        font-weight: 800;
+        font-size: 0.82rem;
+        line-height: 2.2;
+    }
+    .forensic-badge-warning {
+        color: #F59E0B;
+        font-weight: 700;
+        font-size: 0.82rem;
+        line-height: 2.2;
+    }
+    .forensic-badge-info {
+        color: #38BDF8;
+        font-weight: 600;
+        font-size: 0.82rem;
+        line-height: 2.2;
+    }
+    .forensic-badge-verbose {
+        color: #94A3B8;
+        font-size: 0.82rem;
+        line-height: 2.2;
+    }
+
+    .forensic-cell-summary {
+        font-family: 'JetBrains Mono', Consolas, monospace;
+        font-size: 0.80rem;
+        color: #94A3B8;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        line-height: 2.2;
+    }
+
+    /* INLINE ROW EXPANSION: EVENT DATA DRAWER */
+    .forensic-drawer {
+        background-color: #0B1120;
+        border: 1px solid rgba(30, 136, 229, 0.45);
+        border-radius: 8px;
+        padding: 16px 20px;
+        margin: 8px 0 16px 0;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    }
+    .forensic-drawer-title {
+        font-size: 0.76rem;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        color: #94A3B8;
+        text-transform: uppercase;
+        margin-bottom: 8px;
+    }
+    .forensic-payload-box {
+        background-color: #020617;
+        border: 1px solid #1E293B;
+        border-radius: 6px;
+        padding: 14px 18px;
+        font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
+        font-size: 0.82rem;
+        color: #F1F5F9;
+        line-height: 1.6;
+        margin-bottom: 12px;
+        word-break: break-word;
+        max-height: 260px;
+        overflow-y: auto;
+    }
+    .forensic-payload-key {
+        color: #38BDF8;
+        font-weight: 700;
+        margin-right: 10px;
+    }
+    .forensic-payload-val {
+        color: #F1F5F9;
+    }
+
+    /* Filter indicator pill */
+    .filter-indicator-pill {
+        background-color: rgba(30, 136, 229, 0.15);
+        border: 1px solid rgba(30, 136, 229, 0.4);
+        border-radius: 16px;
+        padding: 4px 12px;
+        font-size: 0.82rem;
+        font-weight: 600;
+        color: #38BDF8;
+        display: inline-block;
     }
     </style>
     """,
@@ -200,38 +389,43 @@ st.markdown(
 
 if "active_tab" not in st.session_state:
     st.session_state["active_tab"] = "converter"
-if "last_converted_csv" not in st.session_state:
-    st.session_state["last_converted_csv"] = None
+if "last_converted_file" not in st.session_state:
+    st.session_state["last_converted_file"] = None
 if "viewer_folder" not in st.session_state:
     st.session_state["viewer_folder"] = "Converted files"
-if "conversion_history" not in st.session_state:
-    st.session_state["conversion_history"] = []
-
-
-def clean_event_id_scalar(val: Any) -> str:
-    """Extracts clean numeric EventID if stored as a dictionary string (e.g. {'#text': 4624})."""
-    s = str(val).strip()
-    if "#text" in s:
-        m = re.search(r"['\"]?#text['\"]?\s*:\s*['\"]?(\d+)['\"]?", s)
-        if m:
-            return m.group(1)
-    return s
+if "expanded_record_id" not in st.session_state:
+    st.session_state["expanded_record_id"] = None
+if "raw_view_mode" not in st.session_state:
+    st.session_state["raw_view_mode"] = None
+if "grid_page" not in st.session_state:
+    st.session_state["grid_page"] = 1
+if "grid_page_size" not in st.session_state:
+    st.session_state["grid_page_size"] = 25
+if "grid_sort_asc" not in st.session_state:
+    st.session_state["grid_sort_asc"] = True
 
 
 @st.cache_data(show_spinner=False)
-def load_csv_data(filepath: str) -> pd.DataFrame:
-    """Loads and caches a CSV file as a pandas DataFrame."""
+def load_log_data(filepath: str) -> pd.DataFrame:
+    """Loads and caches a CSV or JSON file as a pandas DataFrame."""
     if not os.path.isfile(filepath):
         return pd.DataFrame()
     try:
-        df = pd.read_csv(filepath, dtype=str, keep_default_na=False)
+        lower_path = filepath.lower()
+        if lower_path.endswith(".json"):
+            df = pd.read_json(filepath, dtype=str)
+        elif lower_path.endswith(".jsonl"):
+            df = pd.read_json(filepath, lines=True, dtype=str)
+        else:
+            df = pd.read_csv(filepath, dtype=str, keep_default_na=False)
+
         df.fillna("", inplace=True)
         df.replace({"null": "", "None": "", "NULL": "", "NaN": "", "nan": ""}, inplace=True)
         if "EventID" in df.columns:
             df["EventID"] = df["EventID"].apply(clean_event_id_scalar)
         return df
     except Exception as e:
-        st.error(f"Error loading CSV file: {e}")
+        st.error(f"Error loading log file: {e}")
         return pd.DataFrame()
 
 
@@ -239,35 +433,55 @@ def load_csv_data(filepath: str) -> pd.DataFrame:
 # SIDEBAR: NAVIGATION & CONTROLS
 # ------------------------------------------------------------------------------
 
-st.sidebar.title("Windows Logs")
+st.sidebar.title("Windows Event Logs")
 st.sidebar.subheader("Navigation")
 page_selection = st.sidebar.radio(
     "Choose Mode:",
-    options=["🔄 Convert EVTX to CSV", "📊 Log Viewer & Inspector"],
+    options=["🔄 Convert EVTX (Multi-Format)", "📊 Forensic Grid & Inspector"],
     index=0 if st.session_state["active_tab"] == "converter" else 1,
 )
-if page_selection == "🔄 Convert EVTX to CSV":
+if page_selection == "🔄 Convert EVTX (Multi-Format)":
     st.session_state["active_tab"] = "converter"
 else:
     st.session_state["active_tab"] = "viewer"
 
+st.sidebar.markdown("---")
+st.sidebar.caption("⚡ **Engine:** `evtx_dump` + `python-evtx` fallback")
+st.sidebar.caption("📁 **Supported Formats:** CSV, JSON, JSONL, XML")
+
 
 # ==============================================================================
-# VIEW 1: CONVERTER (UPLOAD OR PATH)
+# VIEW 1: CONVERTER (MULTI-FORMAT EXPORT)
 # ==============================================================================
 
 if st.session_state["active_tab"] == "converter":
-    st.title("Windows EVTX to CSV Converter")
+    st.title("🔄 Windows EVTX Multi-Format Converter")
     st.markdown(
-        "Convert any Windows `.evtx` event logs to structured `.csv` format. "
-        "Supports browser uploads, local folders and recursive searches without path restrictions."
+        "Convert Windows `.evtx` event logs to **CSV**, **JSON**, **JSON Lines (JSONL)**, or **XML** "
+        "with complete forensic fidelity (all 23 attributes preserved)."
     )
 
-    convert_mode = st.radio(
-        "Select Conversion Method:",
-        options=["📂 Drag & Drop File Upload", "🖥️ File Path / Folder"],
-        horizontal=True,
-    )
+    col_mode, col_fmt = st.columns([2, 1])
+    with col_mode:
+        convert_mode = st.radio(
+            "Select Conversion Method:",
+            options=["📂 Drag & Drop File Upload", "🖥️ File Path / Folder / Wildcard"],
+            horizontal=True,
+        )
+    with col_fmt:
+        export_fmt_label = st.selectbox(
+            "Target Export Format:",
+            options=["CSV (.csv)", "JSON (.json)", "JSON Lines (.jsonl)", "XML (.xml)"],
+            index=0,
+            help="Choose the file format to generate from the EVTX event logs.",
+        )
+        fmt_map = {
+            "CSV (.csv)": ("csv", "text/csv", ".csv"),
+            "JSON (.json)": ("json", "application/json", ".json"),
+            "JSON Lines (.jsonl)": ("jsonl", "application/x-ndjson", ".jsonl"),
+            "XML (.xml)": ("xml", "application/xml", ".xml"),
+        }
+        output_format, mime_type, ext_suffix = fmt_map[export_fmt_label]
 
     # --------------------------------------------------------------------------
     # OPTION A: BROWSER FILE UPLOAD
@@ -275,7 +489,7 @@ if st.session_state["active_tab"] == "converter":
     if convert_mode == "📂 Drag & Drop File Upload":
         st.subheader("Upload .evtx File(s)")
         uploaded_files = st.file_uploader(
-            "Upload one or more .evtx files directly from your computer:",
+            "Upload one or more .evtx files directly from your browser:",
             type=["evtx"],
             accept_multiple_files=True,
             help="Select one or multiple .evtx files to convert.",
@@ -286,19 +500,21 @@ if st.session_state["active_tab"] == "converter":
         if uploaded_files:
             total_upload_mb = sum(getattr(f, "size", 0) for f in uploaded_files) / (1024 * 1024)
             st.info(
-                f"📋 **Auto-detected Details:** Ready to convert **{len(uploaded_files)}** file(s) "
-                f"({total_upload_mb:.2f} MB total). Converted `.csv` files will be automatically stored in: `{default_dest}/`",
+                f"📋 Ready to convert **{len(uploaded_files)}** file(s) "
+                f"({total_upload_mb:.2f} MB total) to **{output_format.upper()}**. "
+                f"Output stored in: `{default_dest}/`",
                 icon="ℹ️",
             )
             with st.expander(f"Inspect Uploaded Files ({len(uploaded_files)} files)", expanded=False):
                 file_summary = []
                 for uf in uploaded_files:
                     f_size_kb = getattr(uf, "size", 0) / 1024
-                    base_csv = os.path.splitext(uf.name)[0] + ".csv"
+                    base_target = os.path.splitext(uf.name)[0] + ext_suffix
                     file_summary.append({
                         "Uploaded File": uf.name,
                         "Size": f"{f_size_kb:.1f} KB" if f_size_kb < 1024 else f"{f_size_kb/1024:.2f} MB",
-                        "Target CSV": base_csv,
+                        "Target File": base_target,
+                        "Format": output_format.upper(),
                     })
                 st.dataframe(pd.DataFrame(file_summary), use_container_width=True)
 
@@ -306,7 +522,6 @@ if st.session_state["active_tab"] == "converter":
                 dest_folder_upload = st.text_input(
                     "Destination folder for converted files:",
                     value=default_dest,
-                    help="Where converted files are saved. Automatically set to your Converted files folder.",
                     key="custom_upload_dest",
                 ).strip() or default_dest
         else:
@@ -330,8 +545,8 @@ if st.session_state["active_tab"] == "converter":
                 start_time = time.time()
 
                 for idx, up_file in enumerate(uploaded_files, 1):
-                    status_text.markdown(f"Converting **{up_file.name}** ({idx}/{total})...")
-                    res = convert_from_upload(up_file, output_dir=dest_folder_upload)
+                    status_text.markdown(f"Converting **{up_file.name}** ({idx}/{total}) to {output_format.upper()}...")
+                    res = convert_from_upload(up_file, output_dir=dest_folder_upload, output_format=output_format)
                     results.append(res)
                     progress_bar.progress(idx / total)
 
@@ -344,7 +559,7 @@ if st.session_state["active_tab"] == "converter":
 
                 st.success(
                     f"🎉 Successfully converted {len(successful)}/{total} file(s) "
-                    f"({total_records:,} total records) in {elapsed:.2f}s!"
+                    f"({total_records:,} total records) to {output_format.upper()} in {elapsed:.2f}s!"
                 )
 
                 summary_data = [
@@ -352,7 +567,8 @@ if st.session_state["active_tab"] == "converter":
                         "File": r["input_file"],
                         "Status": "✅ Success" if r["success"] else "❌ Failed",
                         "Records": f"{r['record_count']:,}",
-                        "Output CSV": r["output_file"],
+                        "Output File": r["output_file"],
+                        "Format": r.get("output_format", output_format).upper(),
                         "Error": r.get("error") or "",
                     }
                     for r in results
@@ -361,13 +577,13 @@ if st.session_state["active_tab"] == "converter":
 
                 if successful:
                     target_file = successful[0]["output_file"]
-                    st.session_state["last_converted_csv"] = target_file
-                    st.session_state["selected_log_path"] = target_file
+                    st.session_state["last_converted_file"] = target_file
+                    st.session_state["active_view_file"] = os.path.basename(target_file)
                     st.cache_data.clear()
 
                     col_view, col_dl = st.columns([1, 1])
                     with col_view:
-                        if st.button(f"📊 Open {os.path.basename(target_file)} in Viewer", type="primary", use_container_width=True):
+                        if st.button(f"📊 Open {os.path.basename(target_file)} in Inspector", type="primary", use_container_width=True):
                             st.session_state["active_tab"] = "viewer"
                             st.session_state["viewer_selected_file"] = target_file
                             st.rerun()
@@ -378,7 +594,7 @@ if st.session_state["active_tab"] == "converter":
                                     label=f"📥 Download {os.path.basename(target_file)}",
                                     data=f_dl.read(),
                                     file_name=os.path.basename(target_file),
-                                    mime="text/csv",
+                                    mime=mime_type,
                                     use_container_width=True,
                                 )
                         except Exception:
@@ -388,8 +604,8 @@ if st.session_state["active_tab"] == "converter":
     # OPTION B: SYSTEM PATH / FOLDER / WILDCARD
     # --------------------------------------------------------------------------
     else:
-        st.subheader("1. Specify Source & Destination Paths")
-        st.caption("Enter any file path, directory path, or wildcard pattern. No restrictions on source or destination.")
+        st.subheader("Specify Source & Destination Paths")
+        st.caption("Enter any file path, directory path, or wildcard pattern on your local filesystem.")
 
         col_src, col_dst = st.columns(2)
         with col_src:
@@ -397,27 +613,24 @@ if st.session_state["active_tab"] == "converter":
                 "Source Path (file, directory, or wildcard pattern):",
                 value="Original Data/evtx" if os.path.isdir("Original Data/evtx") else "",
                 placeholder="e.g. sample.evtx, Original Data/evtx, or logs/*.evtx",
-                help="Accepts relative or absolute paths, home paths (~), and wildcards (*.evtx).",
             )
             recursive_check = st.checkbox(
                 "Recursively scan subdirectories",
                 value=False,
-                help="If checked, searches all nested subfolders for .evtx files.",
             )
 
         with col_dst:
             dest_input = st.text_input(
-                "Destination Location (folder or explicit .csv file):",
+                "Destination Location (folder or explicit output file):",
                 value=st.session_state["viewer_folder"],
-                placeholder="e.g. Converted files or custom_name.csv",
-                help="Where converted files will be stored. Intermediate folders will be created automatically.",
+                placeholder=f"e.g. Converted files or output{ext_suffix}",
             )
 
         col_scan, col_conv = st.columns([1, 2])
         with col_scan:
             scan_clicked = st.button("🔍 Scan & Preview Files", use_container_width=True)
         with col_conv:
-            convert_clicked = st.button("🚀 Start Conversion", type="primary", use_container_width=True)
+            convert_clicked = st.button(f"🚀 Convert to {output_format.upper()}", type="primary", use_container_width=True)
 
         if scan_clicked and source_input:
             detected_files = find_source_files(source_input, recursive=recursive_check)
@@ -446,6 +659,7 @@ if st.session_state["active_tab"] == "converter":
                         source_path=source_input,
                         output_dir=dest_input,
                         recursive=recursive_check,
+                        output_format=output_format,
                         progress_callback=update_progress,
                     )
 
@@ -461,7 +675,7 @@ if st.session_state["active_tab"] == "converter":
 
                         st.success(
                             f"🎉 Converted {len(successful)}/{len(results)} file(s) "
-                            f"({total_records:,} records total) in {elapsed:.2f}s!"
+                            f"({total_records:,} records total) to {output_format.upper()} in {elapsed:.2f}s!"
                         )
 
                         summary_data = [
@@ -469,7 +683,8 @@ if st.session_state["active_tab"] == "converter":
                                 "File": os.path.basename(r["input_file"]),
                                 "Status": "✅ Success" if r["success"] else "❌ Failed",
                                 "Records": f"{r['record_count']:,}",
-                                "Output CSV": r["output_file"],
+                                "Output File": r["output_file"],
+                                "Format": r.get("output_format", output_format).upper(),
                                 "Error": r.get("error") or "",
                             }
                             for r in results
@@ -477,7 +692,7 @@ if st.session_state["active_tab"] == "converter":
                         st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
 
                         if successful:
-                            if st.button("📊 Open Converted Logs in Viewer", use_container_width=True):
+                            if st.button("📊 Open Converted Logs in Inspector", use_container_width=True):
                                 st.session_state["active_tab"] = "viewer"
                                 st.session_state["viewer_selected_file"] = successful[0]["output_file"]
                                 st.rerun()
@@ -489,32 +704,34 @@ if st.session_state["active_tab"] == "converter":
 
 
 # ==============================================================================
-# VIEW 2: LOG VIEWER & INSPECTOR
+# VIEW 2: LOG VIEWER & FORENSIC GRID INSPECTOR
 # ==============================================================================
 
 elif st.session_state["active_tab"] == "viewer":
-    st.title("📊 Windows Event Log Viewer & Inspector")
-    st.markdown("Search, filter, visualize, and inspect payloads of converted event log CSVs.")
+    st.title("📊 Forensic Log Inspector & Grid")
+    st.markdown("Interactive Windows Event Log viewer featuring the exact forensic grid, advanced filters, and inline event drawers.")
 
-    csv_dir = st.session_state.get("viewer_folder", "Converted files")
-    norm_csv_dir = normalize_path(csv_dir)
+    log_dir = st.session_state.get("viewer_folder", "Converted files")
+    norm_log_dir = normalize_path(log_dir)
 
-    available_csvs = []
-    if os.path.isdir(norm_csv_dir):
-        available_csvs = sorted(glob.glob(os.path.join(norm_csv_dir, "*.csv")))
+    available_files = []
+    if os.path.isdir(norm_log_dir):
+        # Look for .csv and .json converted logs
+        for ext in ("*.csv", "*.json", "*.jsonl"):
+            available_files.extend(glob.glob(os.path.join(norm_log_dir, ext)))
+        available_files = sorted(list(set(available_files)))
 
-    # Check if a specific file was requested from the converter tab
+    # Handle file requested from converter tab
     requested_file = st.session_state.pop("viewer_selected_file", None)
     if requested_file and os.path.isfile(requested_file):
         norm_req = normalize_path(requested_file)
-        if norm_req not in [normalize_path(p) for p in available_csvs]:
-            available_csvs.insert(0, norm_req)
+        if norm_req not in [normalize_path(p) for p in available_files]:
+            available_files.insert(0, norm_req)
 
-    if available_csvs:
-        csv_map = {os.path.basename(p): p for p in available_csvs}
-        options = list(csv_map.keys())
+    if available_files:
+        file_map = {os.path.basename(p): p for p in available_files}
+        options = list(file_map.keys())
 
-        # Determine which index to show
         default_index = 0
         if requested_file:
             req_base = os.path.basename(requested_file)
@@ -525,238 +742,447 @@ elif st.session_state["active_tab"] == "viewer":
             default_index = options.index(st.session_state["active_view_file"])
 
         chosen_filename = st.selectbox(
-            "Select Converted CSV File to Inspect:",
+            "Select Converted Log File to Inspect:",
             options=options,
             index=default_index,
             key="active_view_file",
-            format_func=lambda fn: f"{fn} ({os.path.getsize(csv_map[fn]) / 1024:.1f} KB)",
+            format_func=lambda fn: f"{fn} ({os.path.getsize(file_map[fn]) / 1024:.1f} KB)",
         )
-        selected_csv_path = csv_map[chosen_filename]
+        selected_log_path = file_map[chosen_filename]
     else:
-        st.warning(f"No `.csv` files found inside `{csv_dir}`. Convert `.evtx` files in the Converter tab first.")
-        selected_csv_path = None
+        st.warning(f"No converted log files found inside `{log_dir}`. Convert an `.evtx` file in the Converter tab first.")
+        selected_log_path = None
 
-    if selected_csv_path and os.path.isfile(selected_csv_path):
-        df = load_csv_data(selected_csv_path)
+    if selected_log_path and os.path.isfile(selected_log_path):
+        df = load_log_data(selected_log_path)
 
         if df.empty:
-            st.info(f"The selected log `{os.path.basename(selected_csv_path)}` contains 0 records.")
+            st.info(f"The selected log `{os.path.basename(selected_log_path)}` contains 0 records.")
         else:
-            st.info(
-                f"🪵 **Currently Inspecting:** `{os.path.basename(selected_csv_path)}` "
-                f"({len(df):,} total event records loaded)",
-                icon="📊",
-            )
+            # Precompute summary column for high-speed searching and grid display
+            if "_summary_cached" not in df.columns:
+                df["_summary_cached"] = df.apply(compute_event_summary, axis=1)
 
             # ------------------------------------------------------------------
-            # KPI SUMMARY CARDS
+            # 1. COLLAPSIBLE "▸ ADVANCED FILTERS" ACCORDION
             # ------------------------------------------------------------------
-            st.markdown("---")
-            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-            with kpi1:
-                st.metric("Total Events", f"{len(df):,}")
-            with kpi2:
-                unique_event_ids = df["EventID"].nunique() if "EventID" in df.columns else 0
-                st.metric("Unique Event IDs", f"{unique_event_ids:,}")
-            with kpi3:
-                unique_providers = df["Provider"].nunique() if "Provider" in df.columns else 0
-                st.metric("Providers", f"{unique_providers:,}")
-            with kpi4:
-                unique_channels = df["Channel"].nunique() if "Channel" in df.columns else 0
-                st.metric("Channels", f"{unique_channels:,}")
+            with st.expander("▸ Advanced filters", expanded=False):
+                st.caption("Filter records by Event ID, Level, Provider, Channel, Computer, or Keyword.")
 
-            # ------------------------------------------------------------------
-            # VISUAL ANALYTICS (PLOTLY)
-            # ------------------------------------------------------------------
-            st.markdown("---")
-            chart_col1, chart_col2 = st.columns(2)
-
-            with chart_col1:
-                if "EventID" in df.columns and not df.empty:
-                    top_events = (
-                        df["EventID"]
-                        .astype(str)
-                        .value_counts()
-                        .head(10)
-                        .reset_index()
+                flt_r1c1, flt_r1c2, flt_r1c3 = st.columns([2, 1, 1])
+                with flt_r1c1:
+                    filter_keyword = st.text_input(
+                        "Summary / Keyword Search:",
+                        placeholder="Search Summary, EventData, Message, or UserID...",
+                        key="flt_keyword",
                     )
-                    top_events.columns = ["EventID", "Count"]
-                    fig_events = px.bar(
-                        top_events,
-                        x="EventID",
-                        y="Count",
-                        title=f"Top 10 Event IDs ({os.path.basename(selected_csv_path)})",
-                        text="Count",
-                        color="Count",
-                        color_continuous_scale="Blues",
-                    )
-                    fig_events.update_xaxes(type="category")
-                    fig_events.update_layout(margin=dict(l=20, r=20, t=40, b=20), height=320)
-                    st.plotly_chart(fig_events, use_container_width=True)
+                with flt_r1c2:
+                    all_eids = sorted(df["EventID"].unique().tolist()) if "EventID" in df.columns else []
+                    sel_eids = st.multiselect("Event ID:", options=all_eids, key="flt_eids")
+                with flt_r1c3:
+                    all_levels = sorted([lvl for lvl in df["LevelName"].unique().tolist() if lvl]) if "LevelName" in df.columns else []
+                    sel_levels = st.multiselect("Severity Level:", options=all_levels, key="flt_levels")
 
-            with chart_col2:
-                if "Provider" in df.columns and not df.empty:
-                    top_providers = (
-                        df["Provider"]
-                        .astype(str)
-                        .value_counts()
-                        .head(8)
-                        .reset_index()
-                    )
-                    top_providers.columns = ["Provider", "Count"]
-                    fig_prov = px.pie(
-                        top_providers,
-                        names="Provider",
-                        values="Count",
-                        title=f"Event Providers Distribution ({os.path.basename(selected_csv_path)})",
-                        hole=0.4,
-                    )
-                    fig_prov.update_layout(margin=dict(l=20, r=20, t=40, b=20), height=320)
-                    st.plotly_chart(fig_prov, use_container_width=True)
+                flt_r2c1, flt_r2c2, flt_r2c3 = st.columns(3)
+                with flt_r2c1:
+                    all_providers = sorted([pr for pr in df["Provider"].unique().tolist() if pr]) if "Provider" in df.columns else []
+                    sel_providers = st.multiselect("Provider:", options=all_providers, key="flt_providers")
+                with flt_r2c2:
+                    all_channels = sorted([ch for ch in df["Channel"].unique().tolist() if ch]) if "Channel" in df.columns else []
+                    sel_channels = st.multiselect("Channel:", options=all_channels, key="flt_channels")
+                with flt_r2c3:
+                    all_computers = sorted([comp for comp in df["Computer"].unique().tolist() if comp]) if "Computer" in df.columns else []
+                    sel_computers = st.multiselect("Computer:", options=all_computers, key="flt_computers")
 
-            # ------------------------------------------------------------------
-            # FILTER CONTROLS
-            # ------------------------------------------------------------------
-            st.markdown("---")
-            st.subheader("🔍 Search & Filter Records")
+                col_reset, _ = st.columns([1, 4])
+                with col_reset:
+                    if st.button("↺ Reset All Filters", use_container_width=True):
+                        st.session_state["flt_keyword"] = ""
+                        st.session_state["flt_eids"] = []
+                        st.session_state["flt_levels"] = []
+                        st.session_state["flt_providers"] = []
+                        st.session_state["flt_channels"] = []
+                        st.session_state["flt_computers"] = []
+                        st.session_state["grid_page"] = 1
+                        st.rerun()
 
-            f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns(5)
-
-            with f_col1:
-                search_text = st.text_input("Global Search (all fields):", placeholder="Type user, IP, keyword...")
-
-            with f_col2:
-                event_ids = sorted(df["EventID"].unique().tolist()) if "EventID" in df.columns else []
-                sel_event_ids = st.multiselect("Event ID:", options=event_ids)
-
-            with f_col3:
-                levels = sorted([lvl for lvl in df["LevelName"].unique().tolist() if lvl]) if "LevelName" in df.columns else []
-                sel_levels = st.multiselect("Severity Level:", options=levels)
-
-            with f_col4:
-                channels = sorted([ch for ch in df["Channel"].unique().tolist() if ch]) if "Channel" in df.columns else []
-                sel_channels = st.multiselect("Channel:", options=channels)
-
-            with f_col5:
-                providers = sorted([pr for pr in df["Provider"].unique().tolist() if pr]) if "Provider" in df.columns else []
-                sel_providers = st.multiselect("Provider:", options=providers)
-
-            # Apply filters
+            # Apply Filters
             filtered_df = df.copy()
 
-            if search_text:
+            if filter_keyword:
+                kw = filter_keyword.strip().lower()
                 mask = pd.Series(False, index=filtered_df.index)
-                for col in filtered_df.columns:
-                    mask = mask | filtered_df[col].astype(str).str.contains(search_text, case=False, na=False)
+                for col in ["_summary_cached", "EventData", "UserData", "Message", "Computer", "UserID"]:
+                    if col in filtered_df.columns:
+                        mask = mask | filtered_df[col].astype(str).str.lower().str.contains(kw, na=False)
                 filtered_df = filtered_df[mask]
 
-            if sel_event_ids:
-                filtered_df = filtered_df[filtered_df["EventID"].isin(sel_event_ids)]
+            if sel_eids:
+                filtered_df = filtered_df[filtered_df["EventID"].isin(sel_eids)]
 
             if sel_levels:
                 filtered_df = filtered_df[filtered_df["LevelName"].isin(sel_levels)]
 
-            if sel_channels:
-                filtered_df = filtered_df[filtered_df["Channel"].isin(sel_channels)]
-
             if sel_providers:
                 filtered_df = filtered_df[filtered_df["Provider"].isin(sel_providers)]
 
-            st.caption(f"Showing **{len(filtered_df):,}** of **{len(df):,}** records")
+            if sel_channels:
+                filtered_df = filtered_df[filtered_df["Channel"].isin(sel_channels)]
+
+            if sel_computers:
+                filtered_df = filtered_df[filtered_df["Computer"].isin(sel_computers)]
 
             # ------------------------------------------------------------------
-            # DATA TABLE & EXPORT
+            # 2. TOP ACTION BAR (1-CLICK EXPORTS & LIVE COUNTER)
             # ------------------------------------------------------------------
-            core_cols = [
-                "RecordID",
-                "TimeCreated",
-                "EventID",
-                "LevelName",
-                "Channel",
-                "Provider",
-                "Computer",
-                "UserID",
-                "ProcessID",
-                "Task",
-                "Keywords",
-                "EventData",
-                "UserData",
-            ]
-            display_cols = [c for c in core_cols if c in filtered_df.columns]
-            # If any other columns exist, keep them accessible
-            remaining_cols = [c for c in filtered_df.columns if c not in display_cols]
-            table_cols = display_cols + remaining_cols
+            st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
+            act_col_left, act_col_csv, act_col_json, act_col_xml = st.columns([3, 1, 1, 1])
 
-            st.dataframe(filtered_df[table_cols], use_container_width=True, height=380)
+            with act_col_left:
+                base_name = os.path.basename(selected_log_path)
+                if len(filtered_df) == len(df):
+                    st.markdown(
+                        f"**{base_name}** &nbsp;•&nbsp; <span class='filter-indicator-pill'>{len(df):,} total records</span>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f"**{base_name}** &nbsp;•&nbsp; <span class='filter-indicator-pill'>Showing {len(filtered_df):,} of {len(df):,} records (Filtered)</span>",
+                        unsafe_allow_html=True,
+                    )
 
-            csv_bytes = filtered_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label=f"📥 Download Filtered Data as CSV ({len(filtered_df):,} rows)",
-                data=csv_bytes,
-                file_name=f"filtered_{os.path.basename(selected_csv_path)}",
-                mime="text/csv",
-            )
+            # Export filtered records to CSV
+            with act_col_csv:
+                csv_payload = filtered_df[[c for c in CSV_COLUMNS if c in filtered_df.columns]].to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label="📥 Export CSV",
+                    data=csv_payload,
+                    file_name=f"export_{base_name.rsplit('.', 1)[0]}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+            # Export filtered records to JSON
+            with act_col_json:
+                json_payload = filtered_df[[c for c in CSV_COLUMNS if c in filtered_df.columns]].to_json(orient="records", indent=2).encode("utf-8")
+                st.download_button(
+                    label="📥 Export JSON",
+                    data=json_payload,
+                    file_name=f"export_{base_name.rsplit('.', 1)[0]}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+
+            # Export filtered records to XML
+            with act_col_xml:
+                # Generate standard Windows Event XML on the fly
+                records_dict = filtered_df[[c for c in CSV_COLUMNS if c in filtered_df.columns]].to_dict(orient="records")
+                xml_payload = records_to_xml(records_dict).encode("utf-8")
+                st.download_button(
+                    label="📥 Export XML",
+                    data=xml_payload,
+                    file_name=f"export_{base_name.rsplit('.', 1)[0]}.xml",
+                    mime="application/xml",
+                    use_container_width=True,
+                )
+
+            st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
 
             # ------------------------------------------------------------------
-            # RECORD DETAIL & JSON PAYLOAD INSPECTOR
+            # 3. FORENSIC GRID TABLE & CONTROLS
             # ------------------------------------------------------------------
-            st.markdown("---")
-            st.subheader("🔬 Record & EventData Payload Inspector")
-            st.caption("Select an individual event RecordID to inspect its full 23 system attributes and structured JSON payloads.")
-
-            if not filtered_df.empty and "RecordID" in filtered_df.columns:
-                records_list = filtered_df["RecordID"].astype(str).tolist()
-                rec_col, _ = st.columns([2, 2])
-                with rec_col:
-                    selected_rec_id = st.selectbox("Select RecordID to inspect:", options=records_list)
-
-                chosen_row = filtered_df[filtered_df["RecordID"] == selected_rec_id].iloc[0]
-
-                insp_left, insp_right = st.columns([1, 2])
-
-                with insp_left:
-                    st.markdown("##### Full System Metadata")
-                    sys_keys = [
-                        "RecordID", "TimeCreated", "EventID", "Qualifiers", "Level", "LevelName",
-                        "Channel", "Provider", "ProviderGuid", "EventSourceName", "Task", "Opcode",
-                        "Keywords", "Computer", "UserID", "ProcessID", "ThreadID", "Version",
-                        "ActivityID", "RelatedActivityID", "Message"
-                    ]
-                    sys_metadata = {k: chosen_row[k] for k in sys_keys if k in chosen_row and str(chosen_row[k]).strip()}
-                    st.json(sys_metadata)
-
-                with insp_right:
-                    st.markdown("##### Payload Data (EventData & UserData)")
-                    raw_event_data = str(chosen_row.get("EventData", "")).strip()
-                    raw_user_data = str(chosen_row.get("UserData", "")).strip()
-
-                    payload_tabs = []
-                    if raw_event_data:
-                        payload_tabs.append("EventData")
-                    if raw_user_data:
-                        payload_tabs.append("UserData")
-
-                    if payload_tabs:
-                        rendered_tabs = st.tabs([f"📦 {t}" for t in payload_tabs])
-                        for tab, tname in zip(rendered_tabs, payload_tabs):
-                            with tab:
-                                content = raw_event_data if tname == "EventData" else raw_user_data
-                                try:
-                                    parsed = json.loads(content)
-                                    def _clean_json_nulls(o: Any) -> Any:
-                                        if o is None:
-                                            return ""
-                                        if isinstance(o, str) and o.strip().lower() in ("null", "none", "nan"):
-                                            return ""
-                                        if isinstance(o, dict):
-                                            return {k: _clean_json_nulls(v) for k, v in o.items()}
-                                        if isinstance(o, list):
-                                            return [_clean_json_nulls(x) for x in o]
-                                        return o
-                                    st.json(_clean_json_nulls(parsed))
-                                except Exception:
-                                    st.code(content, language="json" if content.startswith(("{", "[")) else "text")
-                    else:
-                        st.info("No EventData or UserData payload attached to this record.")
+            if filtered_df.empty:
+                st.info("No event records match the current filter criteria.")
             else:
-                st.info("No records match the current filter criteria.")
+                # Sorting logic
+                sort_asc = st.session_state.get("grid_sort_asc", True)
+                if "RecordID" in filtered_df.columns:
+                    # Convert to numeric safely for sorting
+                    filtered_df["_rec_num"] = pd.to_numeric(filtered_df["RecordID"], errors="coerce").fillna(0)
+                    filtered_df = filtered_df.sort_values(by="_rec_num", ascending=sort_asc)
+
+                # Pagination controls
+                total_filtered = len(filtered_df)
+                page_size = st.session_state.get("grid_page_size", 25)
+                total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+
+                # Ensure current page in bounds
+                current_page = min(max(1, st.session_state.get("grid_page", 1)), total_pages)
+                st.session_state["grid_page"] = current_page
+
+                # Pagination Toolbar
+                pg_c1, pg_c2, pg_c3, pg_c4, pg_c5, pg_c6 = st.columns([1.2, 0.7, 0.7, 1.4, 0.7, 0.7])
+                with pg_c1:
+                    new_size = st.selectbox(
+                        "Page size:",
+                        options=[25, 50, 100],
+                        index=[25, 50, 100].index(page_size) if page_size in [25, 50, 100] else 0,
+                        key="sel_page_size",
+                        label_visibility="collapsed",
+                    )
+                    if new_size != page_size:
+                        st.session_state["grid_page_size"] = new_size
+                        st.session_state["grid_page"] = 1
+                        st.rerun()
+
+                with pg_c2:
+                    if st.button("⏮ First", disabled=(current_page == 1), use_container_width=True):
+                        st.session_state["grid_page"] = 1
+                        st.rerun()
+                with pg_c3:
+                    if st.button("◀ Prev", disabled=(current_page == 1), use_container_width=True):
+                        st.session_state["grid_page"] = current_page - 1
+                        st.rerun()
+                with pg_c4:
+                    start_num = (current_page - 1) * page_size + 1
+                    end_num = min(current_page * page_size, total_filtered)
+                    st.markdown(
+                        f"<div style='text-align: center; font-size: 0.82rem; line-height: 2.4; color: #94A3B8;'>"
+                        f"Page <b>{current_page}</b> of <b>{total_pages}</b> &nbsp;({start_num:,} - {end_num:,} of {total_filtered:,})"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                with pg_c5:
+                    if st.button("Next ▶", disabled=(current_page == total_pages), use_container_width=True):
+                        st.session_state["grid_page"] = current_page + 1
+                        st.rerun()
+                with pg_c6:
+                    if st.button("Last ⏭", disabled=(current_page == total_pages), use_container_width=True):
+                        st.session_state["grid_page"] = total_pages
+                        st.rerun()
+
+                # Slice records for current page
+                start_idx = (current_page - 1) * page_size
+                page_df = filtered_df.iloc[start_idx : start_idx + page_size]
+
+                # --------------------------------------------------------------
+                # TABLE HEADER ROW
+                # Exact columns: Record # ↑ | Time (UTC) | Level | Event ID | Name | Provider | Channel | Computer | Summary | Details
+                # --------------------------------------------------------------
+                sort_symbol = "↑" if sort_asc else "↓"
+                th_col_widths = [1.1, 1.6, 0.9, 0.9, 0.8, 1.4, 1.2, 1.3, 3.4, 0.9]
+
+                h_rec, h_time, h_lvl, h_eid, h_name, h_prov, h_chan, h_comp, h_sum, h_act = st.columns(th_col_widths)
+                with h_rec:
+                    if st.button(f"Record # {sort_symbol}", key="btn_toggle_sort", help="Click to toggle sorting order", use_container_width=True):
+                        st.session_state["grid_sort_asc"] = not sort_asc
+                        st.rerun()
+                with h_time:
+                    st.markdown("<div class='forensic-th'>Time (UTC)</div>", unsafe_allow_html=True)
+                with h_lvl:
+                    st.markdown("<div class='forensic-th'>Level</div>", unsafe_allow_html=True)
+                with h_eid:
+                    st.markdown("<div class='forensic-th'>Event ID</div>", unsafe_allow_html=True)
+                with h_name:
+                    st.markdown("<div class='forensic-th'>Name</div>", unsafe_allow_html=True)
+                with h_prov:
+                    st.markdown("<div class='forensic-th'>Provider</div>", unsafe_allow_html=True)
+                with h_chan:
+                    st.markdown("<div class='forensic-th'>Channel</div>", unsafe_allow_html=True)
+                with h_comp:
+                    st.markdown("<div class='forensic-th'>Computer</div>", unsafe_allow_html=True)
+                with h_sum:
+                    st.markdown("<div class='forensic-th'>Summary</div>", unsafe_allow_html=True)
+                with h_act:
+                    st.markdown("<div class='forensic-th' style='text-align: center;'>Action</div>", unsafe_allow_html=True)
+
+                st.markdown("<div style='border-bottom: 2px solid #1E88E5; margin-bottom: 6px;'></div>", unsafe_allow_html=True)
+
+                # --------------------------------------------------------------
+                # TABLE ROWS & INLINE EVENT DATA DRAWER
+                # --------------------------------------------------------------
+                expanded_id = st.session_state.get("expanded_record_id")
+
+                for _, row in page_df.iterrows():
+                    rec_id = str(row.get("RecordID", "")).strip()
+                    is_expanded = (expanded_id is not None and expanded_id == rec_id)
+
+                    # Extract row values
+                    raw_time = row.get("TimeCreated", "")
+                    time_display = format_time_utc(raw_time)
+
+                    lvl_name = str(row.get("LevelName", "")).strip() or "Information"
+                    lvl_lower = lvl_name.lower()
+                    if "error" in lvl_lower:
+                        lvl_badge_class = "forensic-badge-error"
+                    elif "crit" in lvl_lower:
+                        lvl_badge_class = "forensic-badge-critical"
+                    elif "warn" in lvl_lower:
+                        lvl_badge_class = "forensic-badge-warning"
+                    elif "info" in lvl_lower:
+                        lvl_badge_class = "forensic-badge-info"
+                    else:
+                        lvl_badge_class = "forensic-badge-verbose"
+
+                    eid_val = str(row.get("EventID", "")).strip()
+                    name_val = str(row.get("Task", "")).strip()
+                    if not name_val or name_val in ("0", "none", "nan"):
+                        name_val = "-"
+
+                    prov_val = str(row.get("Provider", "")).strip() or "-"
+                    chan_val = str(row.get("Channel", "")).strip() or "-"
+                    comp_val = str(row.get("Computer", "")).strip() or "-"
+                    sum_val = str(row.get("_summary_cached", "-"))
+
+                    # Container for the row
+                    r_class = "forensic-row forensic-row-expanded" if is_expanded else "forensic-row"
+                    st.markdown(f"<div class='{r_class}'>", unsafe_allow_html=True)
+
+                    c_rec, c_time, c_lvl, c_eid, c_name, c_prov, c_chan, c_comp, c_sum, c_act = st.columns(th_col_widths)
+
+                    with c_rec:
+                        st.markdown(f"<span class='forensic-cell-mono'>{html.escape(rec_id)}</span>", unsafe_allow_html=True)
+                    with c_time:
+                        st.markdown(f"<span class='forensic-cell-text' title='{html.escape(str(raw_time))}'>{html.escape(time_display)}</span>", unsafe_allow_html=True)
+                    with c_lvl:
+                        st.markdown(f"<span class='{lvl_badge_class}'>{html.escape(lvl_name)}</span>", unsafe_allow_html=True)
+                    with c_eid:
+                        st.markdown(f"<span class='forensic-cell-mono'>{html.escape(eid_val)}</span>", unsafe_allow_html=True)
+                    with c_name:
+                        st.markdown(f"<span class='forensic-cell-text' title='{html.escape(name_val)}'>{html.escape(name_val)}</span>", unsafe_allow_html=True)
+                    with c_prov:
+                        st.markdown(f"<span class='forensic-cell-text' title='{html.escape(prov_val)}'>{html.escape(prov_val)}</span>", unsafe_allow_html=True)
+                    with c_chan:
+                        st.markdown(f"<span class='forensic-cell-text' title='{html.escape(chan_val)}'>{html.escape(chan_val)}</span>", unsafe_allow_html=True)
+                    with c_comp:
+                        st.markdown(f"<span class='forensic-cell-text' title='{html.escape(comp_val)}'>{html.escape(comp_val)}</span>", unsafe_allow_html=True)
+                    with c_sum:
+                        st.markdown(f"<span class='forensic-cell-summary' title='{html.escape(sum_val)}'>{html.escape(sum_val)}</span>", unsafe_allow_html=True)
+
+                    with c_act:
+                        if is_expanded:
+                            if st.button("Close", key=f"btn_close_row_{rec_id}", type="primary", use_container_width=True):
+                                st.session_state["expanded_record_id"] = None
+                                st.session_state["raw_view_mode"] = None
+                                st.rerun()
+                        else:
+                            if st.button("Details", key=f"btn_det_row_{rec_id}", use_container_width=True):
+                                st.session_state["expanded_record_id"] = rec_id
+                                st.session_state["raw_view_mode"] = None
+                                st.rerun()
+
+                    st.markdown("</div>", unsafe_allow_html=True)
+
+                    # ----------------------------------------------------------
+                    # INLINE EVENT DATA DRAWER (IF EXPANDED)
+                    # ----------------------------------------------------------
+                    if is_expanded:
+                        # Extract structured event data
+                        ed_raw = str(row.get("EventData", "")).strip()
+                        unpacked_ed = unpack_event_data_dict(ed_raw)
+
+                        # Build formatted key-value lines
+                        payload_lines = []
+                        if unpacked_ed:
+                            for pk, pv in unpacked_ed.items():
+                                val_clean = str(pv).strip().replace("\r\n", "\n")
+                                payload_lines.append(f"<div style='margin-bottom: 6px;'><span class='forensic-payload-key'>{html.escape(pk)}</span> <span class='forensic-payload-val'>{html.escape(val_clean)}</span></div>")
+                        else:
+                            msg_clean = str(row.get("Message", "")).strip()
+                            if msg_clean:
+                                payload_lines.append(f"<span class='forensic-payload-val'>{html.escape(msg_clean)}</span>")
+                            else:
+                                payload_lines.append("<span style='color: #64748B;'>No EventData or payload parameters attached to this record.</span>")
+
+                        payload_html = "".join(payload_lines)
+
+                        st.markdown(
+                            f"""
+                            <div class="forensic-drawer">
+                                <div class="forensic-drawer-title">EVENT DATA</div>
+                                <div class="forensic-payload-box">
+                                    {payload_html}
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                        # Drawer Action Bar: Show raw XML | Show raw JSON | Close
+                        d_c1, d_c2, d_c3, _ = st.columns([1.3, 1.3, 1.0, 4.0])
+                        with d_c1:
+                            xml_active = (st.session_state.get("raw_view_mode") == "xml")
+                            btn_xml_label = "Hide raw XML" if xml_active else "Show raw XML"
+                            if st.button(btn_xml_label, key=f"drawer_xml_{rec_id}"):
+                                st.session_state["raw_view_mode"] = None if xml_active else "xml"
+                                st.rerun()
+
+                        with d_c2:
+                            json_active = (st.session_state.get("raw_view_mode") == "json")
+                            btn_json_label = "Hide raw JSON" if json_active else "Show raw JSON"
+                            if st.button(btn_json_label, key=f"drawer_json_{rec_id}"):
+                                st.session_state["raw_view_mode"] = None if json_active else "json"
+                                st.rerun()
+
+                        with d_c3:
+                            if st.button("Close", key=f"drawer_close_{rec_id}"):
+                                st.session_state["expanded_record_id"] = None
+                                st.session_state["raw_view_mode"] = None
+                                st.rerun()
+
+                        # Raw XML display
+                        if st.session_state.get("raw_view_mode") == "xml":
+                            clean_rec = row.to_dict()
+                            clean_rec = {k: v for k, v in clean_rec.items() if not k.startswith("_")}
+                            raw_xml_text = record_to_xml(clean_rec)
+                            st.caption("Standard Windows Event XML:")
+                            st.code(raw_xml_text, language="xml")
+
+                        # Raw JSON display
+                        elif st.session_state.get("raw_view_mode") == "json":
+                            clean_rec = row.to_dict()
+                            clean_rec = {k: v for k, v in clean_rec.items() if not k.startswith("_")}
+                            raw_json_text = json.dumps(clean_rec, indent=2)
+                            st.caption("Standard Structured JSON Record:")
+                            st.code(raw_json_text, language="json")
+
+            # ------------------------------------------------------------------
+            # 4. COLLAPSIBLE VISUAL ANALYTICS & METRICS
+            # ------------------------------------------------------------------
+            st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
+            with st.expander("📊 Visual Analytics & Metrics", expanded=False):
+                kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+                with kpi1:
+                    st.metric("Total Filtered Events", f"{len(filtered_df):,}")
+                with kpi2:
+                    u_eids = filtered_df["EventID"].nunique() if "EventID" in filtered_df.columns else 0
+                    st.metric("Unique Event IDs", f"{u_eids:,}")
+                with kpi3:
+                    u_prov = filtered_df["Provider"].nunique() if "Provider" in filtered_df.columns else 0
+                    st.metric("Providers", f"{u_prov:,}")
+                with kpi4:
+                    u_chan = filtered_df["Channel"].nunique() if "Channel" in filtered_df.columns else 0
+                    st.metric("Channels", f"{u_chan:,}")
+
+                st.markdown("---")
+                chart_col1, chart_col2 = st.columns(2)
+                with chart_col1:
+                    if "EventID" in filtered_df.columns and not filtered_df.empty:
+                        top_e = filtered_df["EventID"].astype(str).value_counts().head(10).reset_index()
+                        top_e.columns = ["EventID", "Count"]
+                        fig_e = px.bar(
+                            top_e,
+                            x="EventID",
+                            y="Count",
+                            title=f"Top 10 Event IDs ({os.path.basename(selected_log_path)})",
+                            text="Count",
+                            color="Count",
+                            color_continuous_scale="Blues",
+                        )
+                        fig_e.update_xaxes(type="category")
+                        fig_e.update_layout(margin=dict(l=20, r=20, t=40, b=20), height=320)
+                        st.plotly_chart(fig_e, use_container_width=True)
+
+                with chart_col2:
+                    if "Provider" in filtered_df.columns and not filtered_df.empty:
+                        top_p = filtered_df["Provider"].astype(str).value_counts().head(8).reset_index()
+                        top_p.columns = ["Provider", "Count"]
+                        fig_p = px.pie(
+                            top_p,
+                            names="Provider",
+                            values="Count",
+                            title=f"Event Providers Distribution ({os.path.basename(selected_log_path)})",
+                            hole=0.4,
+                        )
+                        fig_p.update_layout(margin=dict(l=20, r=20, t=40, b=20), height=320)
+                        st.plotly_chart(fig_p, use_container_width=True)

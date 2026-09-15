@@ -25,6 +25,7 @@ Features:
 import argparse
 import csv
 import glob
+import html
 import json
 import os
 import re
@@ -167,30 +168,38 @@ def resolve_output_path(
     source_file_or_name: str,
     destination: str,
     is_single_file: bool = False,
+    output_format: str = "csv",
 ) -> str:
-    """Calculates the target CSV filepath for any source and destination without restrictions.
+    """Calculates the target filepath for any source and destination without restrictions.
 
-    - If destination ends in .csv and converting a single file, saves directly to that .csv file.
-    - If destination is a directory (or converting multiple files), saves as <basename>.csv inside it.
+    Supports formats: 'csv', 'json', 'jsonl', 'xml'.
+    - If destination ends in a supported extension and converting a single file, saves directly to that file.
+    - If destination is a directory (or converting multiple files), saves as <basename>.<format> inside it.
     """
+    clean_fmt = output_format.lower().lstrip(".")
+    if clean_fmt not in ("csv", "json", "jsonl", "xml"):
+        clean_fmt = "csv"
+    ext = f".{clean_fmt}"
+
     dest_cleaned = normalize_path(destination or "Converted files")
     base_name = os.path.splitext(os.path.basename(source_file_or_name))[0]
 
-    if dest_cleaned.lower().endswith(".csv"):
+    valid_exts = (".csv", ".json", ".jsonl", ".xml")
+    if any(dest_cleaned.lower().endswith(e) for e in valid_exts):
         if is_single_file:
-            target_csv = dest_cleaned
+            target_path = dest_cleaned
         else:
             parent = os.path.dirname(dest_cleaned) or "."
-            target_csv = os.path.join(parent, f"{base_name}.csv")
+            target_path = os.path.join(parent, f"{base_name}{ext}")
     else:
-        target_csv = os.path.join(dest_cleaned, f"{base_name}.csv")
+        target_path = os.path.join(dest_cleaned, f"{base_name}{ext}")
 
     # Ensure parent directory exists anywhere on disk
-    parent_dir = os.path.dirname(target_csv)
+    parent_dir = os.path.dirname(target_path)
     if parent_dir:
         os.makedirs(parent_dir, exist_ok=True)
 
-    return target_csv
+    return target_path
 
 
 # ==============================================================================
@@ -435,6 +444,80 @@ def sanitize_record_row(row: Dict[str, Any]) -> Dict[str, str]:
     return clean_row
 
 
+def record_to_xml(record: Dict[str, Any]) -> str:
+    """Generates standard formatted Windows XML for an extracted event record."""
+    clean = sanitize_record_row(record)
+    prov_name = clean.get("Provider", "")
+    prov_guid = clean.get("ProviderGuid", "")
+    eid = clean.get("EventID", "")
+    ver = clean.get("Version", "0")
+    lvl = clean.get("Level", "0")
+    task = clean.get("Task", "0")
+    opcode = clean.get("Opcode", "0")
+    keywords = clean.get("Keywords", "0x0")
+    time_created = clean.get("TimeCreated", "")
+    rec_id = clean.get("RecordID", "")
+    channel = clean.get("Channel", "")
+    computer = clean.get("Computer", "")
+    user_id = clean.get("UserID", "")
+
+    # EventData XML elements
+    event_data_raw = clean.get("EventData", "")
+    event_data_xml = ""
+    if event_data_raw:
+        try:
+            ev_dict = json.loads(event_data_raw)
+            if isinstance(ev_dict, dict):
+                items = []
+                for k, v in ev_dict.items():
+                    items.append(f'    <Data Name="{html.escape(str(k))}">{html.escape(str(v))}</Data>')
+                if items:
+                    event_data_xml = "\n" + "\n".join(items) + "\n  "
+            elif isinstance(ev_dict, list):
+                items = [f'    <Data>{html.escape(str(x))}</Data>' for x in ev_dict]
+                event_data_xml = "\n" + "\n".join(items) + "\n  "
+        except Exception:
+            event_data_xml = f"\n    <Data>{html.escape(str(event_data_raw))}</Data>\n  "
+
+    msg = clean.get("Message", "")
+    rendering_xml = ""
+    if msg:
+        rendering_xml = f"""
+  <RenderingInfo>
+    <Message>{html.escape(msg)}</Message>
+    <Level>{html.escape(str(clean.get("LevelName", "")))}</Level>
+  </RenderingInfo>"""
+
+    guid_attr = f' Guid="{html.escape(prov_guid)}"' if prov_guid else ""
+    return f"""<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="{html.escape(prov_name)}"{guid_attr}/>
+    <EventID>{eid}</EventID>
+    <Version>{ver}</Version>
+    <Level>{lvl}</Level>
+    <Task>{task}</Task>
+    <Opcode>{opcode}</Opcode>
+    <Keywords>{keywords}</Keywords>
+    <TimeCreated SystemTime="{time_created}"/>
+    <EventRecordID>{rec_id}</EventRecordID>
+    <Channel>{html.escape(channel)}</Channel>
+    <Computer>{html.escape(computer)}</Computer>
+    <Security UserID="{html.escape(user_id)}"/>
+  </System>
+  <EventData>{event_data_xml}</EventData>{rendering_xml}
+</Event>"""
+
+
+def records_to_xml(records: List[Dict[str, Any]]) -> str:
+    """Wraps multiple event records in a root <Events> element with XML declaration."""
+    events_xml = "\n".join(record_to_xml(r) for r in records)
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<Events>
+{events_xml}
+</Events>
+"""
+
+
 def extract_record_row(event: Dict[str, Any]) -> Dict[str, Any]:
     """Extracts all 22 standard fields from a raw EVTX event dictionary without dropping any data."""
     system = event.get("System", {}) if isinstance(event.get("System"), dict) else {}
@@ -555,10 +638,10 @@ def extract_record_row(event: Dict[str, Any]) -> Dict[str, Any]:
 # PURE-PYTHON PARSER FALLBACK
 # ==============================================================================
 
-def parse_evtx_python(evtx_path: str, output_csv_path: str) -> int:
+def parse_evtx_python(evtx_path: str, output_path: str, output_format: str = "csv") -> int:
     """Pure-Python fallback parser using `python-evtx` (Evtx.Evtx) and XML parsing.
 
-    Extracts all 22 standard fields and sorts records sequentially.
+    Extracts all 22 standard fields and exports records in CSV, JSON, JSONL, or XML.
     """
     if not HAS_PYTHON_EVTX:
         raise ImportError(
@@ -567,7 +650,7 @@ def parse_evtx_python(evtx_path: str, output_csv_path: str) -> int:
             "or pip (`pip install python-evtx`)."
         )
 
-    parent_dir = os.path.dirname(output_csv_path)
+    parent_dir = os.path.dirname(output_path)
     if parent_dir:
         os.makedirs(parent_dir, exist_ok=True)
 
@@ -739,32 +822,47 @@ def parse_evtx_python(evtx_path: str, output_csv_path: str) -> int:
             return (0, r.get("TimeCreated", ""))
 
     extracted_rows.sort(key=_sort_key)
-
-    with open(output_csv_path, "w", newline="", encoding="utf-8") as f_out:
-        writer = csv.DictWriter(f_out, fieldnames=CSV_COLUMNS, restval="")
-        writer.writeheader()
-        for row in extracted_rows:
-            writer.writerow(sanitize_record_row(row))
+    clean_fmt = output_format.lower().lstrip(".")
+    if clean_fmt == "json":
+        with open(output_path, "w", encoding="utf-8") as f_out:
+            json.dump([sanitize_record_row(r) for r in extracted_rows], f_out, indent=2, ensure_ascii=False)
+    elif clean_fmt == "jsonl":
+        with open(output_path, "w", encoding="utf-8") as f_out:
+            for r in extracted_rows:
+                f_out.write(json.dumps(sanitize_record_row(r), ensure_ascii=False) + "\n")
+    elif clean_fmt == "xml":
+        with open(output_path, "w", encoding="utf-8") as f_out:
+            f_out.write(records_to_xml(extracted_rows))
+    else:
+        with open(output_path, "w", newline="", encoding="utf-8") as f_out:
+            writer = csv.DictWriter(f_out, fieldnames=CSV_COLUMNS, restval="")
+            writer.writeheader()
+            for row in extracted_rows:
+                writer.writerow(sanitize_record_row(row))
 
     return len(extracted_rows)
 
 
 # ==============================================================================
-# CORE SINGLE-FILE CONVERSION
+# CORE SINGLE-FILE CONVERSION (MULTI-FORMAT: CSV, JSON, JSONL, XML)
 # ==============================================================================
 
-def parse_evtx_to_csv(
+def parse_evtx(
     evtx_path: str,
-    output_csv_path: str,
+    output_path: str,
+    output_format: str = "csv",
     dump_tool: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Parses a single .evtx file and writes all 22 structured event fields to CSV.
+    """Parses a single .evtx file and writes structured event records to CSV, JSON, JSONL, or XML.
 
     Ensures zero missing columns and zero dropped entries with multiline JSON buffering
     and sequential record sorting.
     """
     clean_in = normalize_path(evtx_path)
-    clean_out = normalize_path(output_csv_path)
+    clean_out = normalize_path(output_path)
+    clean_fmt = (output_format or "csv").lower().lstrip(".")
+    if clean_fmt not in ("csv", "json", "jsonl", "xml"):
+        clean_fmt = "csv"
 
     if not os.path.isfile(clean_in):
         raise FileNotFoundError(f"Source EVTX file not found: '{evtx_path}' (resolved: '{clean_in}')")
@@ -776,11 +874,12 @@ def parse_evtx_to_csv(
     tool = dump_tool or find_evtx_dump_tool()
 
     if tool == "python-evtx":
-        count = parse_evtx_python(clean_in, clean_out)
+        count = parse_evtx_python(clean_in, clean_out, output_format=clean_fmt)
         return {
             "success": True,
             "input_file": clean_in,
             "output_file": clean_out,
+            "output_format": clean_fmt,
             "record_count": count,
             "error": None,
         }
@@ -802,11 +901,12 @@ def parse_evtx_to_csv(
         except Exception as e:
             if HAS_PYTHON_EVTX:
                 try:
-                    count = parse_evtx_python(clean_in, clean_out)
+                    count = parse_evtx_python(clean_in, clean_out, output_format=clean_fmt)
                     return {
                         "success": True,
                         "input_file": clean_in,
                         "output_file": clean_out,
+                        "output_format": clean_fmt,
                         "record_count": count,
                         "error": None,
                     }
@@ -816,24 +916,27 @@ def parse_evtx_to_csv(
 
         # Multiline JSON streaming buffer to avoid dropping entries with embedded newlines
         json_buffer = ""
-        for line in proc.stdout:
-            if not line:
-                continue
-            json_buffer += line
-            try:
-                data = json.loads(json_buffer)
-                json_buffer = ""  # Reset buffer on successful parse
-                event = data.get("Event") if isinstance(data.get("Event"), dict) else data
-                row = extract_record_row(event)
-                extracted_rows.append(row)
-            except json.JSONDecodeError:
-                # Accumulate multiline JSON payload
-                if len(json_buffer) > 10000000:  # Safety ceiling 10 MB
+        try:
+            for line in proc.stdout:
+                if not line:
+                    continue
+                json_buffer += line
+                try:
+                    data = json.loads(json_buffer)
+                    json_buffer = ""  # Reset buffer on successful parse
+                    event = data.get("Event") if isinstance(data.get("Event"), dict) else data
+                    row = extract_record_row(event)
+                    extracted_rows.append(row)
+                except json.JSONDecodeError:
+                    if len(json_buffer) > 10000000:  # Safety ceiling 10 MB
+                        json_buffer = ""
+                    continue
+                except Exception:
                     json_buffer = ""
-                continue
-            except Exception:
-                json_buffer = ""
-                continue
+                    continue
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
 
         proc.wait()
 
@@ -843,11 +946,12 @@ def parse_evtx_to_csv(
             err_output = stderr_tmp.read().strip()
             if HAS_PYTHON_EVTX:
                 try:
-                    count = parse_evtx_python(clean_in, clean_out)
+                    count = parse_evtx_python(clean_in, clean_out, output_format=clean_fmt)
                     return {
                         "success": True,
                         "input_file": clean_in,
                         "output_file": clean_out,
+                        "output_format": clean_fmt,
                         "record_count": count,
                         "error": None,
                     }
@@ -865,19 +969,60 @@ def parse_evtx_to_csv(
 
     extracted_rows.sort(key=_sort_key)
 
-    with open(clean_out, "w", newline="", encoding="utf-8") as f_out:
-        writer = csv.DictWriter(f_out, fieldnames=CSV_COLUMNS, restval="")
-        writer.writeheader()
-        for row in extracted_rows:
-            writer.writerow(sanitize_record_row(row))
+    # Write formatted output
+    if clean_fmt == "json":
+        with open(clean_out, "w", encoding="utf-8") as f_out:
+            json.dump([sanitize_record_row(r) for r in extracted_rows], f_out, indent=2, ensure_ascii=False)
+    elif clean_fmt == "jsonl":
+        with open(clean_out, "w", encoding="utf-8") as f_out:
+            for r in extracted_rows:
+                f_out.write(json.dumps(sanitize_record_row(r), ensure_ascii=False) + "\n")
+    elif clean_fmt == "xml":
+        with open(clean_out, "w", encoding="utf-8") as f_out:
+            f_out.write(records_to_xml(extracted_rows))
+    else:
+        with open(clean_out, "w", newline="", encoding="utf-8") as f_out:
+            writer = csv.DictWriter(f_out, fieldnames=CSV_COLUMNS, restval="")
+            writer.writeheader()
+            for row in extracted_rows:
+                writer.writerow(sanitize_record_row(row))
 
     return {
         "success": True,
         "input_file": clean_in,
         "output_file": clean_out,
+        "output_format": clean_fmt,
         "record_count": len(extracted_rows),
         "error": None,
     }
+
+
+def parse_evtx_to_csv(
+    evtx_path: str,
+    output_csv_path: str,
+    dump_tool: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Parses a single .evtx file and writes all 22 structured event fields to CSV (backward compatible)."""
+    return parse_evtx(evtx_path, output_csv_path, output_format="csv", dump_tool=dump_tool)
+
+
+def parse_evtx_to_json(
+    evtx_path: str,
+    output_json_path: str,
+    pretty: bool = True,
+    dump_tool: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Parses a single .evtx file and writes structured event records to JSON or JSONL."""
+    return parse_evtx(evtx_path, output_json_path, output_format="json" if pretty else "jsonl", dump_tool=dump_tool)
+
+
+def parse_evtx_to_xml(
+    evtx_path: str,
+    output_xml_path: str,
+    dump_tool: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Parses a single .evtx file and writes formatted event records to XML."""
+    return parse_evtx(evtx_path, output_xml_path, output_format="xml", dump_tool=dump_tool)
 
 
 # ==============================================================================
@@ -890,8 +1035,9 @@ def convert_from_path(
     selected_files: Optional[List[str]] = None,
     progress_callback: Optional[Callable[[int, int, str, int], None]] = None,
     recursive: bool = False,
+    output_format: str = "csv",
 ) -> List[Dict[str, Any]]:
-    """Converts .evtx file(s) given any path (file, directory, or wildcard) and stores CSVs.
+    """Converts .evtx file(s) given any path (file, directory, or wildcard) and stores CSVs, JSON, JSONL, or XML.
 
     No restrictions on source location or destination directory/file format.
     """
@@ -909,10 +1055,10 @@ def convert_from_path(
     total = len(target_files)
 
     for idx, full_input in enumerate(target_files, 1):
-        out_csv = resolve_output_path(full_input, output_dir, is_single_file=is_single_batch)
+        out_file = resolve_output_path(full_input, output_dir, is_single_file=is_single_batch, output_format=output_format)
         fname = os.path.basename(full_input)
         try:
-            res = parse_evtx_to_csv(full_input, out_csv, dump_tool=dump_tool)
+            res = parse_evtx(full_input, out_file, output_format=output_format, dump_tool=dump_tool)
             results.append(res)
             if progress_callback:
                 progress_callback(idx, total, fname, res["record_count"])
@@ -921,7 +1067,8 @@ def convert_from_path(
                 {
                     "success": False,
                     "input_file": full_input,
-                    "output_file": out_csv,
+                    "output_file": out_file,
+                    "output_format": output_format,
                     "record_count": 0,
                     "error": str(err),
                 }
@@ -941,13 +1088,14 @@ def convert_from_upload(
     output_dir: str = "Converted files",
     filename: Optional[str] = None,
     dump_tool: Optional[str] = None,
+    output_format: str = "csv",
 ) -> Dict[str, Any]:
-    """Converts an uploaded file (Streamlit UploadedFile, BytesIO, or raw bytes) to CSV.
+    """Converts an uploaded file (Streamlit UploadedFile, BytesIO, or raw bytes) to CSV, JSON, JSONL, or XML.
 
-    Stores the output CSV with all 22 columns at the designated destination.
+    Stores the output file with all 22 columns at the designated destination.
     """
     actual_name = filename or getattr(uploaded_file, "name", None) or "uploaded_event_log.evtx"
-    out_csv = resolve_output_path(actual_name, output_dir, is_single_file=True)
+    out_file = resolve_output_path(actual_name, output_dir, is_single_file=True, output_format=output_format)
 
     if isinstance(uploaded_file, (bytes, bytearray)):
         content = bytes(uploaded_file)
@@ -970,7 +1118,7 @@ def convert_from_upload(
         tmp.close()
 
     try:
-        res = parse_evtx_to_csv(tmp_path, out_csv, dump_tool=dump_tool)
+        res = parse_evtx(tmp_path, out_file, output_format=output_format, dump_tool=dump_tool)
         res["input_file"] = actual_name
         return res
     finally:
@@ -991,6 +1139,7 @@ def convert(
     selected_files: Optional[List[str]] = None,
     progress_callback: Optional[Callable[[int, int, str, int], None]] = None,
     recursive: bool = False,
+    output_format: str = "csv",
 ) -> List[Dict[str, Any]]:
     """Unified entry point to convert .evtx files via path, upload(s), or raw bytes."""
     if isinstance(source, str):
@@ -1000,6 +1149,7 @@ def convert(
             selected_files=selected_files,
             progress_callback=progress_callback,
             recursive=recursive,
+            output_format=output_format,
         )
 
     if isinstance(source, (list, tuple)):
@@ -1008,9 +1158,9 @@ def convert(
             total = len(source)
             tool = find_evtx_dump_tool()
             for idx, p in enumerate(source, 1):
-                out_csv = resolve_output_path(p, output_dir, is_single_file=False)
+                out_file = resolve_output_path(p, output_dir, is_single_file=False, output_format=output_format)
                 try:
-                    res = parse_evtx_to_csv(p, out_csv, dump_tool=tool)
+                    res = parse_evtx(p, out_file, output_format=output_format, dump_tool=tool)
                     results.append(res)
                     if progress_callback:
                         progress_callback(idx, total, os.path.basename(p), res["record_count"])
@@ -1018,7 +1168,8 @@ def convert(
                     results.append({
                         "success": False,
                         "input_file": p,
-                        "output_file": out_csv,
+                        "output_file": out_file,
+                        "output_format": output_format,
                         "record_count": 0,
                         "error": str(e),
                     })
@@ -1030,14 +1181,14 @@ def convert(
         total = len(source)
         tool = find_evtx_dump_tool()
         for idx, item in enumerate(source, 1):
-            res = convert_from_upload(item, output_dir=output_dir, dump_tool=tool)
+            res = convert_from_upload(item, output_dir=output_dir, dump_tool=tool, output_format=output_format)
             results.append(res)
             if progress_callback:
                 fname = getattr(item, "name", f"upload_{idx}.evtx")
                 progress_callback(idx, total, fname, res["record_count"])
         return results
 
-    single_res = convert_from_upload(source, output_dir=output_dir)
+    single_res = convert_from_upload(source, output_dir=output_dir, output_format=output_format)
     if progress_callback:
         progress_callback(1, 1, single_res["input_file"], single_res["record_count"])
     return [single_res]
@@ -1046,11 +1197,12 @@ def convert(
 def convert_and_load(
     source: Union[str, Any],
     output_dir: str = "Converted files",
+    output_format: str = "csv",
 ) -> Tuple[Any, str, int]:
-    """Converts an .evtx file, stores the CSV, and loads it into a pandas DataFrame."""
+    """Converts an .evtx file, stores the file, and loads it into a pandas DataFrame."""
     import pandas as pd
 
-    results = convert(source=source, output_dir=output_dir)
+    results = convert(source=source, output_dir=output_dir, output_format=output_format)
     if not results:
         raise RuntimeError(f"No files were converted for source: {source}")
 
@@ -1059,14 +1211,19 @@ def convert_and_load(
         err_msg = first.get("error") or "Unknown conversion error"
         raise RuntimeError(f"Conversion failed: {err_msg}")
 
-    out_csv = first["output_file"]
+    out_file = first["output_file"]
     record_count = first["record_count"]
 
-    if record_count == 0 or not os.path.exists(out_csv) or os.path.getsize(out_csv) == 0:
+    if record_count == 0 or not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
         df = pd.DataFrame(columns=CSV_COLUMNS)
     else:
         try:
-            df = pd.read_csv(out_csv, dtype=str, keep_default_na=False)
+            if output_format == "json":
+                df = pd.read_json(out_file, dtype=str)
+            elif output_format == "jsonl":
+                df = pd.read_json(out_file, lines=True, dtype=str)
+            else:
+                df = pd.read_csv(out_file, dtype=str, keep_default_na=False)
             df.fillna("", inplace=True)
             df.replace({"null": "", "None": "", "NULL": "", "NaN": "", "nan": ""}, inplace=True)
             for col in CSV_COLUMNS:
@@ -1075,7 +1232,7 @@ def convert_and_load(
         except Exception:
             df = pd.DataFrame(columns=CSV_COLUMNS)
 
-    return df, out_csv, record_count
+    return df, out_file, record_count
 
 
 # Backward-compatibility aliases
@@ -1089,22 +1246,22 @@ convert_evtx_bytes = convert_from_upload
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert any Windows .evtx event logs to CSV with all 22 columns and full chronological ordering.",
+        description="Convert any Windows .evtx event logs to CSV, JSON, JSONL, or XML with all 22 columns and full chronological ordering.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  # Single file conversion
+  # Single file conversion (CSV default)
   python fileconversion.py sample.evtx
   python fileconversion.py sample.evtx my_output.csv
   python fileconversion.py -i "~/Desktop/Security.evtx" -o "/tmp/Security.csv"
 
+  # Convert to JSON or XML
+  python fileconversion.py sample.evtx -o sample.json -f json
+  python fileconversion.py sample.evtx -o sample.xml -f xml
+
   # Directory conversion
   python fileconversion.py "Original Data/evtx"
-  python fileconversion.py -i "Original Data/evtx" -o "Converted files"
+  python fileconversion.py -i "Original Data/evtx" -o "Converted files" -f json
   python fileconversion.py -i "C:\\Windows\\System32\\winevt\\Logs" -o "D:\\Logs" -r
-
-  # Wildcard conversion
-  python fileconversion.py "*.evtx"
-  python fileconversion.py "logs/*.evtx" -o "output_csvs"
 """,
     )
     parser.add_argument(
@@ -1117,7 +1274,7 @@ def main():
         "dest_pos",
         nargs="?",
         default=None,
-        help="Destination directory or CSV file path (positional, optional).",
+        help="Destination directory or output file path (positional, optional).",
     )
     parser.add_argument(
         "-i",
@@ -1133,7 +1290,15 @@ def main():
         "--output",
         dest="output_path",
         default=None,
-        help="Destination directory or CSV file path (defaults to 'Converted files').",
+        help="Destination directory or output file path (defaults to 'Converted files').",
+    )
+    parser.add_argument(
+        "-f",
+        "--format",
+        dest="output_format",
+        default="csv",
+        choices=["csv", "json", "jsonl", "xml"],
+        help="Export format: 'csv', 'json', 'jsonl', or 'xml' (defaults to 'csv').",
     )
     parser.add_argument(
         "-r",
@@ -1163,6 +1328,7 @@ def main():
         print(f"🚀 Starting conversion:")
         print(f"   Source     : {source}")
         print(f"   Destination: {destination}")
+        print(f"   Format     : {args.output_format.upper()}")
         if args.recursive:
             print(f"   Mode       : Recursive directory search enabled")
 
@@ -1171,6 +1337,7 @@ def main():
             output_dir=destination,
             selected_files=args.selected_files,
             recursive=args.recursive,
+            output_format=args.output_format,
             progress_callback=lambda idx, total, fn, count: print(
                 f"   [{idx}/{total}] ✅ {fn} -> {count:,} records converted"
             ),
@@ -1187,7 +1354,7 @@ def main():
         print("\n" + "=" * 60)
         print(f"✨ Conversion complete: {len(successful)}/{len(results)} file(s) successful.")
         print(f"📊 Total event records converted: {total_records:,}")
-        print(f"📋 Columns extracted: {len(CSV_COLUMNS)} columns ({', '.join(CSV_COLUMNS[:7])}...)")
+        print(f"📋 Format: {args.output_format.upper()} ({len(CSV_COLUMNS)} columns extracted)")
 
         if successful:
             print(f"📁 Destination output: '{destination}'")
