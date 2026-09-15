@@ -293,19 +293,6 @@ st.markdown(
         text-overflow: ellipsis !important;
     }
 
-    /* Summary column: allow popover overflow without clipping */
-    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:nth-child(9) {
-        overflow: visible !important;
-    }
-    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:nth-child(9) div[data-testid="stMarkdownContainer"] {
-        overflow: visible !important;
-    }
-    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:nth-child(9) div[data-testid="stMarkdownContainer"] p {
-        overflow: visible !important;
-        display: flex !important;
-        align-items: center !important;
-    }
-
     /* Action button column: exact centering and compact 26px height */
     div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child {
         display: flex !important;
@@ -356,15 +343,6 @@ st.markdown(
         overflow: hidden !important;
         text-overflow: ellipsis !important;
         display: block !important;
-    }
-    .cell-sum {
-        font-family: 'JetBrains Mono', Consolas, monospace !important;
-        font-size: 0.78rem !important;
-        color: #334155 !important;
-        white-space: nowrap !important;
-        overflow: hidden !important;
-        text-overflow: ellipsis !important;
-        display: inline-block !important;
     }
 
     /* SEVERITY PILL BADGES */
@@ -879,8 +857,8 @@ elif st.session_state["active_tab"] == "viewer":
                 flt_r1c1, flt_r1c2, flt_r1c3 = st.columns([2, 1, 1])
                 with flt_r1c1:
                     filter_keyword = st.text_input(
-                        "Summary / Keyword Search:",
-                        placeholder="Search Summary, EventData, Message, or UserID...",
+                        "Keyword Search:",
+                        placeholder="Search EventData, UserData, Message, or UserID...",
                         key="flt_keyword",
                     )
                 with flt_r1c2:
@@ -1073,20 +1051,19 @@ elif st.session_state["active_tab"] == "viewer":
                 # Exact columns: Record # ↑ | Time (UTC) | Level | Event ID | Name | Provider | Channel | Computer | Summary | Action
                 # --------------------------------------------------------------
                 sort_symbol = "↑" if sort_asc else "↓"
-                th_col_widths = [1.1, 1.6, 0.9, 0.9, 0.8, 1.5, 1.3, 1.4, 3.5, 0.9]
+                th_col_widths = [1.2, 1.8, 1.1, 1.1, 1.1, 2.2, 1.8, 1.8, 1.1]
 
                 header_html = f"""
                 <div style="display: flex; background-color: #0F172A; border-radius: 6px; padding: 10px 10px; margin-bottom: 4px; align-items: center; border-bottom: 2px solid #1E88E5;">
-                    <div style="flex: 1.1; font-size: 0.78rem; font-weight: 800; color: #F59E0B; text-transform: uppercase; letter-spacing: 0.05em;">Record # {sort_symbol}</div>
-                    <div style="flex: 1.6; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Time (UTC)</div>
-                    <div style="flex: 0.9; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Level</div>
-                    <div style="flex: 0.9; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Event ID</div>
-                    <div style="flex: 0.8; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Name</div>
-                    <div style="flex: 1.5; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Provider</div>
-                    <div style="flex: 1.3; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Channel</div>
-                    <div style="flex: 1.4; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Computer</div>
-                    <div style="flex: 3.5; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Summary</div>
-                    <div style="flex: 0.9; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em; text-align: center;">Action</div>
+                    <div style="flex: 1.2; font-size: 0.78rem; font-weight: 800; color: #F59E0B; text-transform: uppercase; letter-spacing: 0.05em;">Record # {sort_symbol}</div>
+                    <div style="flex: 1.8; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Time (UTC)</div>
+                    <div style="flex: 1.1; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Level</div>
+                    <div style="flex: 1.1; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Event ID</div>
+                    <div style="flex: 1.1; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Name</div>
+                    <div style="flex: 2.2; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Provider</div>
+                    <div style="flex: 1.8; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Channel</div>
+                    <div style="flex: 1.8; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Computer</div>
+                    <div style="flex: 1.1; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em; text-align: center;">Action</div>
                 </div>
                 """
                 st.markdown(header_html, unsafe_allow_html=True)
@@ -1124,9 +1101,8 @@ elif st.session_state["active_tab"] == "viewer":
                     prov_val = str(row.get("Provider", "")).strip() or "-"
                     chan_val = str(row.get("Channel", "")).strip() or "-"
                     comp_val = str(row.get("Computer", "")).strip() or "-"
-                    sum_val = str(row.get("_summary_cached", "-"))
 
-                    c_rec, c_time, c_lvl, c_eid, c_name, c_prov, c_chan, c_comp, c_sum, c_act = st.columns(th_col_widths)
+                    c_rec, c_time, c_lvl, c_eid, c_name, c_prov, c_chan, c_comp, c_act = st.columns(th_col_widths)
 
                     with c_rec:
                         st.markdown(f"<span class='cell-mono'>{html.escape(rec_id)}</span>", unsafe_allow_html=True)
@@ -1144,30 +1120,6 @@ elif st.session_state["active_tab"] == "viewer":
                         st.markdown(f"<span class='cell-text' title='{html.escape(chan_val)}'>{html.escape(chan_val)}</span>", unsafe_allow_html=True)
                     with c_comp:
                         st.markdown(f"<span class='cell-mono' title='{html.escape(comp_val)}'>{html.escape(comp_val)}</span>", unsafe_allow_html=True)
-
-                    # Summary column with compact preview and 'read more..' expander
-                    with c_sum:
-                        clean_sum = re.sub(r"\s+", " ", str(sum_val)).strip()
-                        CUTOFF = 60
-                        if len(clean_sum) <= CUTOFF:
-                            safe_sum = html.escape(clean_sum).replace("`", "&#96;")
-                            st.markdown(f"<span class='cell-sum' title='{safe_sum}'>{safe_sum}</span>", unsafe_allow_html=True)
-                        else:
-                            snippet = html.escape(clean_sum[:CUTOFF]).replace("`", "&#96;")
-                            full_safe = html.escape(clean_sum).replace("`", "&#96;").replace("*", "&#42;").replace("_", "&#95;")
-                            details_html = f"""
-                            <div style="display: flex; align-items: center; gap: 6px; width: 100%; font-family: 'JetBrains Mono', Consolas, monospace;">
-                                <span class="cell-sum" title="{full_safe}" style="max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block;">{snippet}...</span>
-                                <details class="read-more-wrapper" style="display: inline-block; position: relative;">
-                                    <summary style="cursor: pointer; color: #1E88E5; font-size: 0.74rem; font-weight: 700; white-space: nowrap; text-decoration: underline;">read more..</summary>
-                                    <div style="position: absolute; right: 0; top: 22px; z-index: 9999; width: 440px; max-height: 180px; overflow-y: auto; background: #FFFFFF; border: 1px solid #94A3B8; border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.18); padding: 10px 12px; font-size: 0.76rem; color: #0F172A; white-space: pre-wrap; word-break: break-word; line-height: 1.5;">
-                                        <div style="font-weight: 800; color: #1E88E5; font-size: 0.72rem; text-transform: uppercase; margin-bottom: 4px;">Full Summary:</div>
-                                        {full_safe}
-                                    </div>
-                                </details>
-                            </div>
-                            """
-                            st.markdown(details_html, unsafe_allow_html=True)
 
                     with c_act:
                         if is_expanded:
