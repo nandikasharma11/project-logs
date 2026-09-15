@@ -15,6 +15,7 @@ Features:
 import glob
 import html
 import importlib
+import inspect
 import json
 import os
 import re
@@ -42,6 +43,15 @@ convert_from_upload = getattr(fileconversion, "convert_from_upload")
 record_to_xml = getattr(fileconversion, "record_to_xml")
 records_to_xml = getattr(fileconversion, "records_to_xml")
 CSV_COLUMNS = getattr(fileconversion, "CSV_COLUMNS")
+
+
+# Streamlit 1.40+ deprecation-free width parameter helper
+def stretch_kw() -> Dict[str, Any]:
+    """Returns width='stretch' if supported by current Streamlit, else use_container_width=True."""
+    sig = inspect.signature(st.button)
+    if "width" in sig.parameters:
+        return {"width": "stretch"}
+    return {"use_container_width": True}
 
 
 def normalize_path(p: Optional[str]) -> str:
@@ -157,7 +167,7 @@ def clean_event_id_scalar(val: Any) -> str:
 
 
 # ------------------------------------------------------------------------------
-# STREAMLIT CONFIGURATION & STYLING (FORENSIC BLUE & CYBER PALETTE)
+# STREAMLIT CONFIGURATION & STYLING (HIGH CONTRAST & PERFECT ALIGNMENT)
 # ------------------------------------------------------------------------------
 
 st.set_page_config(
@@ -171,15 +181,25 @@ st.markdown(
     <style>
     /* Metric Card Styling */
     div[data-testid="metric-container"] {
-        background-color: rgba(30, 136, 229, 0.06);
-        border: 1px solid rgba(30, 136, 229, 0.22);
+        background-color: #FFFFFF;
+        border: 1px solid #E2E8F0;
         padding: 12px 18px;
         border-radius: 10px;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
         transition: all 0.2s ease-in-out;
     }
     div[data-testid="metric-container"]:hover {
-        border-color: rgba(30, 136, 229, 0.55);
-        background-color: rgba(30, 136, 229, 0.12);
+        border-color: #1E88E5;
+        box-shadow: 0 4px 12px rgba(30, 136, 229, 0.12);
+    }
+    div[data-testid="metric-container"] label {
+        color: #64748B !important;
+        font-weight: 600 !important;
+        font-size: 0.80rem !important;
+    }
+    div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
+        color: #0F172A !important;
+        font-weight: 800 !important;
     }
 
     /* Primary Buttons -> Blue */
@@ -190,7 +210,7 @@ st.markdown(
         background-color: #1E88E5 !important;
         border-color: #1976D2 !important;
         color: #FFFFFF !important;
-        box-shadow: 0 4px 14px rgba(30, 136, 229, 0.25) !important;
+        box-shadow: 0 2px 8px rgba(30, 136, 229, 0.25) !important;
         border-radius: 6px !important;
         font-weight: 600 !important;
     }
@@ -200,157 +220,216 @@ st.markdown(
         background-color: #1976D2 !important;
         border-color: #1565C0 !important;
         color: #FFFFFF !important;
-        box-shadow: 0 6px 18px rgba(30, 136, 229, 0.40) !important;
+        box-shadow: 0 4px 12px rgba(30, 136, 229, 0.35) !important;
     }
 
     /* Secondary / Action Buttons */
     .stButton > button {
         border-radius: 6px !important;
         font-size: 0.85rem !important;
+        border-color: #CBD5E1 !important;
+        color: #1E293B !important;
+        background-color: #FFFFFF !important;
         transition: all 0.15s ease-in-out;
     }
-
-    /* Compact Grid Row Buttons */
-    div.forensic-row-container div[data-testid="stButton"] button {
-        padding: 3px 8px !important;
-        min-height: 28px !important;
-        font-size: 0.78rem !important;
-        font-weight: 600 !important;
-        width: 100% !important;
-    }
-
-    /* Radio Buttons & Inputs */
-    div[data-testid="stRadio"] [role="radiogroup"] label[data-checked="true"] p {
+    .stButton > button:hover {
+        border-color: #1E88E5 !important;
         color: #1E88E5 !important;
+        background-color: #F8FAFC !important;
+    }
+
+    /* Download Buttons */
+    .stDownloadButton > button {
+        border-color: #1E88E5 !important;
+        color: #1E88E5 !important;
+        background-color: #FFFFFF !important;
+        border-radius: 6px !important;
         font-weight: 600 !important;
     }
+    .stDownloadButton > button:hover {
+        background-color: rgba(30, 136, 229, 0.08) !important;
+        border-color: #1565C0 !important;
+        color: #1565C0 !important;
+    }
+
+    /* Inputs focus */
     input:focus, textarea:focus, div[data-baseweb="input"]:focus-within {
         border-color: #1E88E5 !important;
         box-shadow: 0 0 0 1px #1E88E5 !important;
     }
 
-    /* FORENSIC GRID STYLING */
-    .forensic-header-bar {
-        background-color: #0F172A;
-        border-top: 1px solid #334155;
-        border-bottom: 2px solid #1E88E5;
-        padding: 10px 8px;
-        margin-bottom: 6px;
-        border-radius: 6px 6px 0 0;
-    }
-    .forensic-th {
-        font-size: 0.80rem;
-        font-weight: 700;
-        letter-spacing: 0.04em;
-        color: #94A3B8;
-        text-transform: uppercase;
-        overflow: hidden;
-        white-space: nowrap;
-        text-overflow: ellipsis;
-    }
-    .forensic-th-highlight {
-        color: #F59E0B !important; /* Gold highlight for sorted column */
-        font-weight: 800;
+    /* ------------------------------------------------------------- */
+    /* FORENSIC GRID ROW ALIGNMENT & FONT CONTRAST                   */
+    /* ------------------------------------------------------------- */
+
+    /* Ensure every horizontal block is vertically centered */
+    div[data-testid="stHorizontalBlock"] {
+        align-items: center !important;
     }
 
-    .forensic-row {
-        padding: 6px 4px;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-        align-items: center;
-        transition: background-color 0.15s ease-in-out;
-    }
-    .forensic-row:hover {
-        background-color: rgba(30, 136, 229, 0.05);
-    }
-    .forensic-row-expanded {
-        background-color: rgba(30, 136, 229, 0.10) !important;
-        border-left: 3px solid #1E88E5;
+    /* Ensure each column has no top margin displacement */
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: flex-start !important;
+        min-height: 32px !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
     }
 
-    .forensic-cell-mono {
-        font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
-        font-size: 0.82rem;
-        color: #CBD5E1;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        line-height: 2.2;
-    }
-    .forensic-cell-text {
-        font-size: 0.82rem;
-        color: #E2E8F0;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        line-height: 2.2;
+    /* Remove paragraph margins which caused 16px displacement */
+    div[data-testid="stHorizontalBlock"] div[data-testid="stMarkdownContainer"] p {
+        margin: 0 !important;
+        padding: 0 !important;
+        line-height: 28px !important;
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
     }
 
-    /* Severity Badges */
-    .forensic-badge-error {
-        color: #EF4444;
-        font-weight: 700;
-        font-size: 0.82rem;
-        line-height: 2.2;
+    /* Action button column: exact centering and compact 26px height */
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
     }
-    .forensic-badge-critical {
-        color: #DC2626;
-        font-weight: 800;
-        font-size: 0.82rem;
-        line-height: 2.2;
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child div[data-testid="stButton"] {
+        width: 100% !important;
+        margin: 0 !important;
     }
-    .forensic-badge-warning {
-        color: #F59E0B;
-        font-weight: 700;
-        font-size: 0.82rem;
-        line-height: 2.2;
-    }
-    .forensic-badge-info {
-        color: #38BDF8;
-        font-weight: 600;
-        font-size: 0.82rem;
-        line-height: 2.2;
-    }
-    .forensic-badge-verbose {
-        color: #94A3B8;
-        font-size: 0.82rem;
-        line-height: 2.2;
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child div[data-testid="stButton"] button {
+        height: 26px !important;
+        min-height: 26px !important;
+        max-height: 26px !important;
+        line-height: 24px !important;
+        padding: 0 6px !important;
+        font-size: 0.76rem !important;
+        font-weight: 600 !important;
+        margin: 0 !important;
+        border-radius: 4px !important;
+        width: 100% !important;
     }
 
-    .forensic-cell-summary {
-        font-family: 'JetBrains Mono', Consolas, monospace;
-        font-size: 0.80rem;
-        color: #94A3B8;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        line-height: 2.2;
+    /* HIGH-CONTRAST CELL TYPOGRAPHY ON LIGHT BACKGROUND */
+    .cell-mono {
+        font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace !important;
+        font-size: 0.82rem !important;
+        font-weight: 700 !important;
+        color: #0F172A !important; /* Deep dark slate - high contrast */
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        display: block !important;
+    }
+    .cell-time {
+        font-family: 'JetBrains Mono', Consolas, monospace !important;
+        font-size: 0.80rem !important;
+        color: #1E293B !important; /* Dark slate 800 */
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        display: block !important;
+    }
+    .cell-text {
+        font-size: 0.82rem !important;
+        color: #0F172A !important; /* Dark slate 900 */
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        display: block !important;
+    }
+    .cell-sum {
+        font-family: 'JetBrains Mono', Consolas, monospace !important;
+        font-size: 0.80rem !important;
+        color: #334155 !important; /* Slate 700 */
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        display: block !important;
+    }
+
+    /* SEVERITY PILL BADGES */
+    .badge-error {
+        background-color: #FEE2E2 !important;
+        color: #DC2626 !important;
+        border: 1px solid #FCA5A5 !important;
+        border-radius: 10px !important;
+        padding: 1px 7px !important;
+        font-size: 0.76rem !important;
+        font-weight: 700 !important;
+        display: inline-block !important;
+        line-height: 1.4 !important;
+    }
+    .badge-critical {
+        background-color: #FEE2E2 !important;
+        color: #991B1B !important;
+        border: 1px solid #F87171 !important;
+        border-radius: 10px !important;
+        padding: 1px 7px !important;
+        font-weight: 800 !important;
+        font-size: 0.76rem !important;
+        display: inline-block !important;
+        line-height: 1.4 !important;
+    }
+    .badge-warning {
+        background-color: #FEF3C7 !important;
+        color: #B45309 !important;
+        border: 1px solid #FCD34D !important;
+        border-radius: 10px !important;
+        padding: 1px 7px !important;
+        font-size: 0.76rem !important;
+        font-weight: 700 !important;
+        display: inline-block !important;
+        line-height: 1.4 !important;
+    }
+    .badge-info {
+        background-color: #E0F2FE !important;
+        color: #0369A1 !important;
+        border: 1px solid #BAE6FD !important;
+        border-radius: 10px !important;
+        padding: 1px 7px !important;
+        font-size: 0.76rem !important;
+        font-weight: 600 !important;
+        display: inline-block !important;
+        line-height: 1.4 !important;
+    }
+    .badge-verbose {
+        background-color: #F1F5F9 !important;
+        color: #475569 !important;
+        border: 1px solid #CBD5E1 !important;
+        border-radius: 10px !important;
+        padding: 1px 7px !important;
+        font-size: 0.76rem !important;
+        display: inline-block !important;
+        line-height: 1.4 !important;
     }
 
     /* INLINE ROW EXPANSION: EVENT DATA DRAWER */
     .forensic-drawer {
-        background-color: #0B1120;
-        border: 1px solid rgba(30, 136, 229, 0.45);
+        background-color: #FFFFFF;
+        border: 1px solid #CBD5E1;
+        border-left: 4px solid #1E88E5;
         border-radius: 8px;
         padding: 16px 20px;
-        margin: 8px 0 16px 0;
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+        margin: 6px 0 14px 0;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.06);
     }
     .forensic-drawer-title {
-        font-size: 0.76rem;
+        font-size: 0.78rem;
         font-weight: 800;
         letter-spacing: 0.08em;
-        color: #94A3B8;
+        color: #0F172A;
         text-transform: uppercase;
         margin-bottom: 8px;
     }
     .forensic-payload-box {
-        background-color: #020617;
+        background-color: #0F172A;
         border: 1px solid #1E293B;
         border-radius: 6px;
         padding: 14px 18px;
         font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
         font-size: 0.82rem;
-        color: #F1F5F9;
+        color: #F8FAFC;
         line-height: 1.6;
         margin-bottom: 12px;
         word-break: break-word;
@@ -363,18 +442,18 @@ st.markdown(
         margin-right: 10px;
     }
     .forensic-payload-val {
-        color: #F1F5F9;
+        color: #F8FAFC;
     }
 
     /* Filter indicator pill */
     .filter-indicator-pill {
-        background-color: rgba(30, 136, 229, 0.15);
-        border: 1px solid rgba(30, 136, 229, 0.4);
+        background-color: rgba(30, 136, 229, 0.12);
+        border: 1px solid rgba(30, 136, 229, 0.35);
         border-radius: 16px;
-        padding: 4px 12px;
+        padding: 3px 12px;
         font-size: 0.82rem;
-        font-weight: 600;
-        color: #38BDF8;
+        font-weight: 700;
+        color: #1E88E5;
         display: inline-block;
     }
     </style>
@@ -516,7 +595,7 @@ if st.session_state["active_tab"] == "converter":
                         "Target File": base_target,
                         "Format": output_format.upper(),
                     })
-                st.dataframe(pd.DataFrame(file_summary), use_container_width=True)
+                st.dataframe(pd.DataFrame(file_summary), **stretch_kw())
 
             with st.expander("⚙️ Destination Settings (Optional)", expanded=False):
                 dest_folder_upload = st.text_input(
@@ -529,7 +608,7 @@ if st.session_state["active_tab"] == "converter":
 
         col_btn, _ = st.columns([1, 3])
         with col_btn:
-            start_upload_conv = st.button("🚀 Convert Uploaded Files", type="primary", use_container_width=True)
+            start_upload_conv = st.button("🚀 Convert Uploaded Files", type="primary", **stretch_kw())
 
         if start_upload_conv:
             if not uploaded_files:
@@ -573,7 +652,7 @@ if st.session_state["active_tab"] == "converter":
                     }
                     for r in results
                 ]
-                st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
+                st.dataframe(pd.DataFrame(summary_data), **stretch_kw())
 
                 if successful:
                     target_file = successful[0]["output_file"]
@@ -583,7 +662,7 @@ if st.session_state["active_tab"] == "converter":
 
                     col_view, col_dl = st.columns([1, 1])
                     with col_view:
-                        if st.button(f"📊 Open {os.path.basename(target_file)} in Inspector", type="primary", use_container_width=True):
+                        if st.button(f"📊 Open {os.path.basename(target_file)} in Inspector", type="primary", **stretch_kw()):
                             st.session_state["active_tab"] = "viewer"
                             st.session_state["viewer_selected_file"] = target_file
                             st.rerun()
@@ -595,7 +674,7 @@ if st.session_state["active_tab"] == "converter":
                                     data=f_dl.read(),
                                     file_name=os.path.basename(target_file),
                                     mime=mime_type,
-                                    use_container_width=True,
+                                    **stretch_kw(),
                                 )
                         except Exception:
                             pass
@@ -628,9 +707,9 @@ if st.session_state["active_tab"] == "converter":
 
         col_scan, col_conv = st.columns([1, 2])
         with col_scan:
-            scan_clicked = st.button("🔍 Scan & Preview Files", use_container_width=True)
+            scan_clicked = st.button("🔍 Scan & Preview Files", **stretch_kw())
         with col_conv:
-            convert_clicked = st.button(f"🚀 Convert to {output_format.upper()}", type="primary", use_container_width=True)
+            convert_clicked = st.button(f"🚀 Convert to {output_format.upper()}", type="primary", **stretch_kw())
 
         if scan_clicked and source_input:
             detected_files = find_source_files(source_input, recursive=recursive_check)
@@ -689,10 +768,10 @@ if st.session_state["active_tab"] == "converter":
                             }
                             for r in results
                         ]
-                        st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
+                        st.dataframe(pd.DataFrame(summary_data), **stretch_kw())
 
                         if successful:
-                            if st.button("📊 Open Converted Logs in Inspector", use_container_width=True):
+                            if st.button("📊 Open Converted Logs in Inspector", **stretch_kw()):
                                 st.session_state["active_tab"] = "viewer"
                                 st.session_state["viewer_selected_file"] = successful[0]["output_file"]
                                 st.rerun()
@@ -716,7 +795,6 @@ elif st.session_state["active_tab"] == "viewer":
 
     available_files = []
     if os.path.isdir(norm_log_dir):
-        # Look for .csv and .json converted logs
         for ext in ("*.csv", "*.json", "*.jsonl"):
             available_files.extend(glob.glob(os.path.join(norm_log_dir, ext)))
         available_files = sorted(list(set(available_files)))
@@ -796,7 +874,7 @@ elif st.session_state["active_tab"] == "viewer":
 
                 col_reset, _ = st.columns([1, 4])
                 with col_reset:
-                    if st.button("↺ Reset All Filters", use_container_width=True):
+                    if st.button("↺ Reset All Filters", **stretch_kw()):
                         st.session_state["flt_keyword"] = ""
                         st.session_state["flt_eids"] = []
                         st.session_state["flt_levels"] = []
@@ -842,12 +920,16 @@ elif st.session_state["active_tab"] == "viewer":
                 base_name = os.path.basename(selected_log_path)
                 if len(filtered_df) == len(df):
                     st.markdown(
-                        f"**{base_name}** &nbsp;•&nbsp; <span class='filter-indicator-pill'>{len(df):,} total records</span>",
+                        f"<div style='line-height: 38px; color: #0F172A; font-weight: 600; font-size: 0.92rem;'>"
+                        f"<b>{base_name}</b> &nbsp;•&nbsp; <span class='filter-indicator-pill'>{len(df):,} total records</span>"
+                        f"</div>",
                         unsafe_allow_html=True,
                     )
                 else:
                     st.markdown(
-                        f"**{base_name}** &nbsp;•&nbsp; <span class='filter-indicator-pill'>Showing {len(filtered_df):,} of {len(df):,} records (Filtered)</span>",
+                        f"<div style='line-height: 38px; color: #0F172A; font-weight: 600; font-size: 0.92rem;'>"
+                        f"<b>{base_name}</b> &nbsp;•&nbsp; <span class='filter-indicator-pill'>Showing {len(filtered_df):,} of {len(df):,} records (Filtered)</span>"
+                        f"</div>",
                         unsafe_allow_html=True,
                     )
 
@@ -859,7 +941,7 @@ elif st.session_state["active_tab"] == "viewer":
                     data=csv_payload,
                     file_name=f"export_{base_name.rsplit('.', 1)[0]}.csv",
                     mime="text/csv",
-                    use_container_width=True,
+                    **stretch_kw(),
                 )
 
             # Export filtered records to JSON
@@ -870,12 +952,11 @@ elif st.session_state["active_tab"] == "viewer":
                     data=json_payload,
                     file_name=f"export_{base_name.rsplit('.', 1)[0]}.json",
                     mime="application/json",
-                    use_container_width=True,
+                    **stretch_kw(),
                 )
 
             # Export filtered records to XML
             with act_col_xml:
-                # Generate standard Windows Event XML on the fly
                 records_dict = filtered_df[[c for c in CSV_COLUMNS if c in filtered_df.columns]].to_dict(orient="records")
                 xml_payload = records_to_xml(records_dict).encode("utf-8")
                 st.download_button(
@@ -883,7 +964,7 @@ elif st.session_state["active_tab"] == "viewer":
                     data=xml_payload,
                     file_name=f"export_{base_name.rsplit('.', 1)[0]}.xml",
                     mime="application/xml",
-                    use_container_width=True,
+                    **stretch_kw(),
                 )
 
             st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
@@ -894,10 +975,8 @@ elif st.session_state["active_tab"] == "viewer":
             if filtered_df.empty:
                 st.info("No event records match the current filter criteria.")
             else:
-                # Sorting logic
                 sort_asc = st.session_state.get("grid_sort_asc", True)
                 if "RecordID" in filtered_df.columns:
-                    # Convert to numeric safely for sorting
                     filtered_df["_rec_num"] = pd.to_numeric(filtered_df["RecordID"], errors="coerce").fillna(0)
                     filtered_df = filtered_df.sort_values(by="_rec_num", ascending=sort_asc)
 
@@ -906,12 +985,11 @@ elif st.session_state["active_tab"] == "viewer":
                 page_size = st.session_state.get("grid_page_size", 25)
                 total_pages = max(1, (total_filtered + page_size - 1) // page_size)
 
-                # Ensure current page in bounds
                 current_page = min(max(1, st.session_state.get("grid_page", 1)), total_pages)
                 st.session_state["grid_page"] = current_page
 
-                # Pagination Toolbar
-                pg_c1, pg_c2, pg_c3, pg_c4, pg_c5, pg_c6 = st.columns([1.2, 0.7, 0.7, 1.4, 0.7, 0.7])
+                # Pagination & Sorting Toolbar
+                pg_c1, pg_sort, pg_c2, pg_c3, pg_c4, pg_c5, pg_c6 = st.columns([1.1, 1.6, 0.7, 0.7, 1.5, 0.7, 0.7])
                 with pg_c1:
                     new_size = st.selectbox(
                         "Page size:",
@@ -925,29 +1003,35 @@ elif st.session_state["active_tab"] == "viewer":
                         st.session_state["grid_page"] = 1
                         st.rerun()
 
+                with pg_sort:
+                    sort_lbl = f"⇅ Sort: Record # ({'Asc ↑' if sort_asc else 'Desc ↓'})"
+                    if st.button(sort_lbl, key="btn_toggle_sort", **stretch_kw()):
+                        st.session_state["grid_sort_asc"] = not sort_asc
+                        st.rerun()
+
                 with pg_c2:
-                    if st.button("⏮ First", disabled=(current_page == 1), use_container_width=True):
+                    if st.button("⏮ First", disabled=(current_page == 1), **stretch_kw()):
                         st.session_state["grid_page"] = 1
                         st.rerun()
                 with pg_c3:
-                    if st.button("◀ Prev", disabled=(current_page == 1), use_container_width=True):
+                    if st.button("◀ Prev", disabled=(current_page == 1), **stretch_kw()):
                         st.session_state["grid_page"] = current_page - 1
                         st.rerun()
                 with pg_c4:
                     start_num = (current_page - 1) * page_size + 1
                     end_num = min(current_page * page_size, total_filtered)
                     st.markdown(
-                        f"<div style='text-align: center; font-size: 0.82rem; line-height: 2.4; color: #94A3B8;'>"
+                        f"<div style='text-align: center; font-size: 0.82rem; line-height: 32px; color: #475569; font-weight: 600;'>"
                         f"Page <b>{current_page}</b> of <b>{total_pages}</b> &nbsp;({start_num:,} - {end_num:,} of {total_filtered:,})"
                         f"</div>",
                         unsafe_allow_html=True,
                     )
                 with pg_c5:
-                    if st.button("Next ▶", disabled=(current_page == total_pages), use_container_width=True):
+                    if st.button("Next ▶", disabled=(current_page == total_pages), **stretch_kw()):
                         st.session_state["grid_page"] = current_page + 1
                         st.rerun()
                 with pg_c6:
-                    if st.button("Last ⏭", disabled=(current_page == total_pages), use_container_width=True):
+                    if st.button("Last ⏭", disabled=(current_page == total_pages), **stretch_kw()):
                         st.session_state["grid_page"] = total_pages
                         st.rerun()
 
@@ -956,37 +1040,27 @@ elif st.session_state["active_tab"] == "viewer":
                 page_df = filtered_df.iloc[start_idx : start_idx + page_size]
 
                 # --------------------------------------------------------------
-                # TABLE HEADER ROW
-                # Exact columns: Record # ↑ | Time (UTC) | Level | Event ID | Name | Provider | Channel | Computer | Summary | Details
+                # TABLE HEADER ROW (FLEXBOX SINGLE CONTAINER)
+                # Exact columns: Record # ↑ | Time (UTC) | Level | Event ID | Name | Provider | Channel | Computer | Summary | Action
                 # --------------------------------------------------------------
                 sort_symbol = "↑" if sort_asc else "↓"
-                th_col_widths = [1.1, 1.6, 0.9, 0.9, 0.8, 1.4, 1.2, 1.3, 3.4, 0.9]
+                th_col_widths = [1.1, 1.6, 0.9, 0.9, 0.8, 1.5, 1.3, 1.4, 3.5, 0.9]
 
-                h_rec, h_time, h_lvl, h_eid, h_name, h_prov, h_chan, h_comp, h_sum, h_act = st.columns(th_col_widths)
-                with h_rec:
-                    if st.button(f"Record # {sort_symbol}", key="btn_toggle_sort", help="Click to toggle sorting order", use_container_width=True):
-                        st.session_state["grid_sort_asc"] = not sort_asc
-                        st.rerun()
-                with h_time:
-                    st.markdown("<div class='forensic-th'>Time (UTC)</div>", unsafe_allow_html=True)
-                with h_lvl:
-                    st.markdown("<div class='forensic-th'>Level</div>", unsafe_allow_html=True)
-                with h_eid:
-                    st.markdown("<div class='forensic-th'>Event ID</div>", unsafe_allow_html=True)
-                with h_name:
-                    st.markdown("<div class='forensic-th'>Name</div>", unsafe_allow_html=True)
-                with h_prov:
-                    st.markdown("<div class='forensic-th'>Provider</div>", unsafe_allow_html=True)
-                with h_chan:
-                    st.markdown("<div class='forensic-th'>Channel</div>", unsafe_allow_html=True)
-                with h_comp:
-                    st.markdown("<div class='forensic-th'>Computer</div>", unsafe_allow_html=True)
-                with h_sum:
-                    st.markdown("<div class='forensic-th'>Summary</div>", unsafe_allow_html=True)
-                with h_act:
-                    st.markdown("<div class='forensic-th' style='text-align: center;'>Action</div>", unsafe_allow_html=True)
-
-                st.markdown("<div style='border-bottom: 2px solid #1E88E5; margin-bottom: 6px;'></div>", unsafe_allow_html=True)
+                header_html = f"""
+                <div style="display: flex; background-color: #0F172A; border-radius: 6px; padding: 10px 10px; margin-bottom: 4px; align-items: center; border-bottom: 2px solid #1E88E5;">
+                    <div style="flex: 1.1; font-size: 0.78rem; font-weight: 800; color: #F59E0B; text-transform: uppercase; letter-spacing: 0.05em;">Record # {sort_symbol}</div>
+                    <div style="flex: 1.6; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Time (UTC)</div>
+                    <div style="flex: 0.9; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Level</div>
+                    <div style="flex: 0.9; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Event ID</div>
+                    <div style="flex: 0.8; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Name</div>
+                    <div style="flex: 1.5; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Provider</div>
+                    <div style="flex: 1.3; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Channel</div>
+                    <div style="flex: 1.4; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Computer</div>
+                    <div style="flex: 3.5; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Summary</div>
+                    <div style="flex: 0.9; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em; text-align: center;">Action</div>
+                </div>
+                """
+                st.markdown(header_html, unsafe_allow_html=True)
 
                 # --------------------------------------------------------------
                 # TABLE ROWS & INLINE EVENT DATA DRAWER
@@ -997,22 +1071,21 @@ elif st.session_state["active_tab"] == "viewer":
                     rec_id = str(row.get("RecordID", "")).strip()
                     is_expanded = (expanded_id is not None and expanded_id == rec_id)
 
-                    # Extract row values
                     raw_time = row.get("TimeCreated", "")
                     time_display = format_time_utc(raw_time)
 
                     lvl_name = str(row.get("LevelName", "")).strip() or "Information"
                     lvl_lower = lvl_name.lower()
                     if "error" in lvl_lower:
-                        lvl_badge_class = "forensic-badge-error"
+                        lvl_badge_class = "badge-error"
                     elif "crit" in lvl_lower:
-                        lvl_badge_class = "forensic-badge-critical"
+                        lvl_badge_class = "badge-critical"
                     elif "warn" in lvl_lower:
-                        lvl_badge_class = "forensic-badge-warning"
+                        lvl_badge_class = "badge-warning"
                     elif "info" in lvl_lower:
-                        lvl_badge_class = "forensic-badge-info"
+                        lvl_badge_class = "badge-info"
                     else:
-                        lvl_badge_class = "forensic-badge-verbose"
+                        lvl_badge_class = "badge-verbose"
 
                     eid_val = str(row.get("EventID", "")).strip()
                     name_val = str(row.get("Task", "")).strip()
@@ -1024,54 +1097,46 @@ elif st.session_state["active_tab"] == "viewer":
                     comp_val = str(row.get("Computer", "")).strip() or "-"
                     sum_val = str(row.get("_summary_cached", "-"))
 
-                    # Container for the row
-                    r_class = "forensic-row forensic-row-expanded" if is_expanded else "forensic-row"
-                    st.markdown(f"<div class='{r_class}'>", unsafe_allow_html=True)
-
                     c_rec, c_time, c_lvl, c_eid, c_name, c_prov, c_chan, c_comp, c_sum, c_act = st.columns(th_col_widths)
 
                     with c_rec:
-                        st.markdown(f"<span class='forensic-cell-mono'>{html.escape(rec_id)}</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span class='cell-mono'>{html.escape(rec_id)}</span>", unsafe_allow_html=True)
                     with c_time:
-                        st.markdown(f"<span class='forensic-cell-text' title='{html.escape(str(raw_time))}'>{html.escape(time_display)}</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span class='cell-time' title='{html.escape(str(raw_time))}'>{html.escape(time_display)}</span>", unsafe_allow_html=True)
                     with c_lvl:
                         st.markdown(f"<span class='{lvl_badge_class}'>{html.escape(lvl_name)}</span>", unsafe_allow_html=True)
                     with c_eid:
-                        st.markdown(f"<span class='forensic-cell-mono'>{html.escape(eid_val)}</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span class='cell-mono'>{html.escape(eid_val)}</span>", unsafe_allow_html=True)
                     with c_name:
-                        st.markdown(f"<span class='forensic-cell-text' title='{html.escape(name_val)}'>{html.escape(name_val)}</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span class='cell-text' title='{html.escape(name_val)}'>{html.escape(name_val)}</span>", unsafe_allow_html=True)
                     with c_prov:
-                        st.markdown(f"<span class='forensic-cell-text' title='{html.escape(prov_val)}'>{html.escape(prov_val)}</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span class='cell-text' title='{html.escape(prov_val)}'>{html.escape(prov_val)}</span>", unsafe_allow_html=True)
                     with c_chan:
-                        st.markdown(f"<span class='forensic-cell-text' title='{html.escape(chan_val)}'>{html.escape(chan_val)}</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span class='cell-text' title='{html.escape(chan_val)}'>{html.escape(chan_val)}</span>", unsafe_allow_html=True)
                     with c_comp:
-                        st.markdown(f"<span class='forensic-cell-text' title='{html.escape(comp_val)}'>{html.escape(comp_val)}</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span class='cell-mono' title='{html.escape(comp_val)}'>{html.escape(comp_val)}</span>", unsafe_allow_html=True)
                     with c_sum:
-                        st.markdown(f"<span class='forensic-cell-summary' title='{html.escape(sum_val)}'>{html.escape(sum_val)}</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span class='cell-sum' title='{html.escape(sum_val)}'>{html.escape(sum_val)}</span>", unsafe_allow_html=True)
 
                     with c_act:
                         if is_expanded:
-                            if st.button("Close", key=f"btn_close_row_{rec_id}", type="primary", use_container_width=True):
+                            if st.button("Close", key=f"btn_close_row_{rec_id}", type="primary", **stretch_kw()):
                                 st.session_state["expanded_record_id"] = None
                                 st.session_state["raw_view_mode"] = None
                                 st.rerun()
                         else:
-                            if st.button("Details", key=f"btn_det_row_{rec_id}", use_container_width=True):
+                            if st.button("Details", key=f"btn_det_row_{rec_id}", **stretch_kw()):
                                 st.session_state["expanded_record_id"] = rec_id
                                 st.session_state["raw_view_mode"] = None
                                 st.rerun()
-
-                    st.markdown("</div>", unsafe_allow_html=True)
 
                     # ----------------------------------------------------------
                     # INLINE EVENT DATA DRAWER (IF EXPANDED)
                     # ----------------------------------------------------------
                     if is_expanded:
-                        # Extract structured event data
                         ed_raw = str(row.get("EventData", "")).strip()
                         unpacked_ed = unpack_event_data_dict(ed_raw)
 
-                        # Build formatted key-value lines
                         payload_lines = []
                         if unpacked_ed:
                             for pk, pv in unpacked_ed.items():
@@ -1082,7 +1147,7 @@ elif st.session_state["active_tab"] == "viewer":
                             if msg_clean:
                                 payload_lines.append(f"<span class='forensic-payload-val'>{html.escape(msg_clean)}</span>")
                             else:
-                                payload_lines.append("<span style='color: #64748B;'>No EventData or payload parameters attached to this record.</span>")
+                                payload_lines.append("<span style='color: #94A3B8;'>No EventData or payload parameters attached to this record.</span>")
 
                         payload_html = "".join(payload_lines)
 
@@ -1103,19 +1168,19 @@ elif st.session_state["active_tab"] == "viewer":
                         with d_c1:
                             xml_active = (st.session_state.get("raw_view_mode") == "xml")
                             btn_xml_label = "Hide raw XML" if xml_active else "Show raw XML"
-                            if st.button(btn_xml_label, key=f"drawer_xml_{rec_id}"):
+                            if st.button(btn_xml_label, key=f"drawer_xml_{rec_id}", **stretch_kw()):
                                 st.session_state["raw_view_mode"] = None if xml_active else "xml"
                                 st.rerun()
 
                         with d_c2:
                             json_active = (st.session_state.get("raw_view_mode") == "json")
                             btn_json_label = "Hide raw JSON" if json_active else "Show raw JSON"
-                            if st.button(btn_json_label, key=f"drawer_json_{rec_id}"):
+                            if st.button(btn_json_label, key=f"drawer_json_{rec_id}", **stretch_kw()):
                                 st.session_state["raw_view_mode"] = None if json_active else "json"
                                 st.rerun()
 
                         with d_c3:
-                            if st.button("Close", key=f"drawer_close_{rec_id}"):
+                            if st.button("Close", key=f"drawer_close_{rec_id}", **stretch_kw()):
                                 st.session_state["expanded_record_id"] = None
                                 st.session_state["raw_view_mode"] = None
                                 st.rerun()
@@ -1171,7 +1236,7 @@ elif st.session_state["active_tab"] == "viewer":
                         )
                         fig_e.update_xaxes(type="category")
                         fig_e.update_layout(margin=dict(l=20, r=20, t=40, b=20), height=320)
-                        st.plotly_chart(fig_e, use_container_width=True)
+                        st.plotly_chart(fig_e, **stretch_kw())
 
                 with chart_col2:
                     if "Provider" in filtered_df.columns and not filtered_df.empty:
@@ -1185,4 +1250,4 @@ elif st.session_state["active_tab"] == "viewer":
                             hole=0.4,
                         )
                         fig_p.update_layout(margin=dict(l=20, r=20, t=40, b=20), height=320)
-                        st.plotly_chart(fig_p, use_container_width=True)
+                        st.plotly_chart(fig_p, **stretch_kw())
