@@ -32,3 +32,6 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Storage & Vector DB
+qdrant_storage/
