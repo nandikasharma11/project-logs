@@ -233,3 +233,137 @@ def test_generate_chatgpt_forensic_response():
     assert "Why Did This Query Return No Results?" in resp_zero
     assert "Channel Mismatch" in resp_zero
 
+
+def test_app_correlation_resource_and_sync():
+    """Validates that get_correlation_mgr is available and sync_dataframe_to_duckdb
+    builds the entity_correlations table.
+    """
+    corr_mgr = app.get_correlation_mgr()
+    assert corr_mgr is not None
+
+    test_conn = duckdb.connect(":memory:")
+    df = pd.DataFrame([
+        {
+            "RecordID": "501",
+            "TimeCreated": "2026-09-15 12:00:00",
+            "EventID": "4624",
+            "Level": "0",
+            "LevelName": "LogAlways",
+            "Channel": "Security",
+            "Provider": "Microsoft-Windows-Security-Auditing",
+            "Computer": "WORKSTATION-01",
+            "ProcessID": "400",
+            "ThreadID": "50",
+            "UserID": "S-1-5-21-500",
+            "Message": "Successful logon",
+            "EventData": '{"TargetLogonId": "0x3e7", "TargetUserName": "SYSTEM"}',
+            "RawXML": "<Event>501</Event>",
+        },
+        {
+            "RecordID": "502",
+            "TimeCreated": "2026-09-15 12:00:15",
+            "EventID": "7036",
+            "Level": "4",
+            "LevelName": "Information",
+            "Channel": "System",
+            "Provider": "Service Control Manager",
+            "Computer": "WORKSTATION-01",
+            "ProcessID": "400",
+            "ThreadID": "55",
+            "UserID": "S-1-5-18",
+            "Message": "Service entered the running state",
+            "EventData": '{"ServiceName": "ForensicSvc"}',
+            "RawXML": "<Event>502</Event>",
+        },
+    ])
+
+    res = app.sync_dataframe_to_duckdb(test_conn, df, scope_key="test_corr_scope", force_resync=True)
+    assert res["records"] == 2
+    assert "correlations" in res
+    assert "corr_stats" in res
+    assert "entity_correlations" in [r[0] for r in test_conn.execute("SHOW TABLES").fetchall()]
+
+
+def test_app_generate_chatgpt_correlation_response():
+    """Validates that generate_chatgpt_forensic_response produces a dedicated
+    Cross-Channel Correlation & Causal Sequence section when correlated events are supplied.
+    """
+    parser = app.get_query_parser()
+    qf = parser.parse("What else happened around record 501?")
+    assert qf.intent == "correlation"
+
+    sample_records = pd.DataFrame([
+        {
+            "RecordID": "501",
+            "TimeCreated": "2026-09-15 12:00:00",
+            "EventID": "4624",
+            "LevelName": "LogAlways",
+            "Channel": "Security",
+            "Provider": "Microsoft-Windows-Security-Auditing",
+            "Computer": "WORKSTATION-01",
+            "ProcessID": "400",
+            "UserID": "SYSTEM",
+            "Message": "Successful logon",
+            "EventData": "{}",
+        },
+        {
+            "RecordID": "502",
+            "TimeCreated": "2026-09-15 12:00:15",
+            "EventID": "7036",
+            "LevelName": "Information",
+            "Channel": "System",
+            "Provider": "Service Control Manager",
+            "Computer": "WORKSTATION-01",
+            "ProcessID": "400",
+            "UserID": "SYSTEM",
+            "Message": "Service started",
+            "EventData": "{}",
+        }
+    ])
+
+    correlated_events = [
+        {
+            "event_record_id": "502",
+            "source_type": "System",
+            "event_id": "7036",
+            "provider": "Service Control Manager",
+            "time_created_utc": "2026-09-15 12:00:15",
+            "entity_type": "process_id",
+            "entity_value": "400",
+            "confidence": "Low",
+            "confidence_weight": 0.3,
+            "time_delta_seconds": 15,
+            "time_delta_str": "+15s",
+            "relation_reason": "Matching bare process_id within tight 300s window",
+        }
+    ]
+
+    anchor_record = {
+        "RecordID": "501",
+        "EventID": "4624",
+        "Channel": "Security",
+        "TimeCreated": "2026-09-15 12:00:00",
+    }
+
+    resp = app.generate_chatgpt_forensic_response(
+        query="What else happened around record 501?",
+        qf=qf,
+        records=sample_records,
+        templates=[],
+        scope_label="All Converted Logs",
+        total_scope_records=100,
+        correlated_events=correlated_events,
+        anchor_record=anchor_record,
+    )
+
+    assert "### 🔍 Forensic Findings" in resp
+    assert "Cross-channel correlation around **Anchor Record `#501`" in resp
+    assert "Cross-Channel Correlation & Causal Sequence" in resp
+    assert "⚓ **Anchor Event:** Record `#501`" in resp
+    assert "+15s" in resp
+    assert "System" in resp
+    assert "7036" in resp
+    assert "process_id: 400" in resp
+    assert "Correlation Assessment" in resp
+
+

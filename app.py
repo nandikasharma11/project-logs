@@ -36,6 +36,7 @@ from log_templater import DuckDBTemplateManager, Drain3ChannelManager, get_event
 from stage3_vectorizing import TemplateEmbedder, TemplateVectorIndex, construct_representative_text
 from query_parser import ForensicQueryParser, QueryFilter, TimeRange
 from query_executor import EventQueryExecutor
+from correlation_indexer import CorrelationIndexManager, find_correlated
 
 try:
     importlib.reload(fileconversion)
@@ -635,6 +636,52 @@ st.markdown(
         line-height: 1.4 !important;
     }
 
+    /* CORRELATION CONFIDENCE PILL BADGES */
+    .badge-corr-high {
+        background-color: #DCFCE7 !important;
+        color: #15803D !important;
+        border: 1px solid #86EFAC !important;
+        border-radius: 10px !important;
+        padding: 1px 7px !important;
+        font-size: 0.76rem !important;
+        font-weight: 700 !important;
+        display: inline-block !important;
+        line-height: 1.4 !important;
+    }
+    .badge-corr-med {
+        background-color: #FEF3C7 !important;
+        color: #B45309 !important;
+        border: 1px solid #FCD34D !important;
+        border-radius: 10px !important;
+        padding: 1px 7px !important;
+        font-size: 0.76rem !important;
+        font-weight: 700 !important;
+        display: inline-block !important;
+        line-height: 1.4 !important;
+    }
+    .badge-corr-low {
+        background-color: #F1F5F9 !important;
+        color: #475569 !important;
+        border: 1px solid #CBD5E1 !important;
+        border-radius: 10px !important;
+        padding: 1px 7px !important;
+        font-size: 0.76rem !important;
+        font-weight: 600 !important;
+        display: inline-block !important;
+        line-height: 1.4 !important;
+    }
+    .badge-corr-anchor {
+        background-color: #DBEAFE !important;
+        color: #1D4ED8 !important;
+        border: 1px solid #93C5FD !important;
+        border-radius: 10px !important;
+        padding: 1px 7px !important;
+        font-size: 0.76rem !important;
+        font-weight: 800 !important;
+        display: inline-block !important;
+        line-height: 1.4 !important;
+    }
+
     /* INLINE ROW EXPANSION: EVENT DATA DRAWER */
     .forensic-drawer {
         background-color: #FFFFFF;
@@ -833,28 +880,47 @@ def get_query_executor() -> EventQueryExecutor:
     return EventQueryExecutor()
 
 
+@st.cache_resource
+def get_correlation_mgr() -> CorrelationIndexManager:
+    """Provides the cross-channel entity correlation manager."""
+    return CorrelationIndexManager()
+
+
 def sync_dataframe_to_duckdb(
     conn: duckdb.DuckDBPyConnection,
     df: pd.DataFrame,
     scope_key: str,
     force_resync: bool = False,
 ) -> Dict[str, Any]:
-    """Syncs DataFrame into DuckDB canonical_logs, clusters with Drain3, and indexes templates in Qdrant."""
+    """Syncs DataFrame into DuckDB canonical_logs, clusters with Drain3, indexes templates in Qdrant,
+    and builds the cross-channel entity correlation index.
+    """
     if df.empty:
-        return {"records": 0, "templates": 0, "vectors": 0, "drain_stats": {}, "vector_stats": {}}
+        return {
+            "records": 0,
+            "templates": 0,
+            "vectors": 0,
+            "correlations": 0,
+            "drain_stats": {},
+            "vector_stats": {},
+            "corr_stats": {},
+        }
 
     tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
     table_exists = "canonical_logs" in tables
     templates_exist = "log_templates" in tables and "template_instances" in tables
+    corr_exists = "entity_correlations" in tables
 
-    needs_full_reload = not table_exists or not templates_exist or force_resync
+    needs_full_reload = not table_exists or not templates_exist or not corr_exists or force_resync
     if table_exists and not needs_full_reload:
         current_count = conn.execute("SELECT COUNT(*) FROM canonical_logs").fetchone()[0]
         tpl_count_curr = conn.execute("SELECT COUNT(*) FROM log_templates").fetchone()[0] if "log_templates" in tables else 0
-        if current_count != len(df) or tpl_count_curr == 0:
+        corr_count_curr = conn.execute("SELECT COUNT(*) FROM entity_correlations").fetchone()[0] if "entity_correlations" in tables else 0
+        if current_count != len(df) or tpl_count_curr == 0 or corr_count_curr == 0:
             needs_full_reload = True
 
     if needs_full_reload:
+        conn.execute("DROP TABLE IF EXISTS entity_correlations")
         conn.execute("DROP TABLE IF EXISTS template_instances")
         conn.execute("DROP TABLE IF EXISTS log_templates")
         conn.execute("DROP TABLE IF EXISTS canonical_logs")
@@ -871,16 +937,24 @@ def sync_dataframe_to_duckdb(
     v_idx = get_vector_index(embedder)
     v_stats = v_idx.index_from_duckdb(conn, templates_table="log_templates")
 
-    rec_count = conn.execute("SELECT COUNT(*) FROM canonical_logs").fetchone()[0]
-    tpl_count = conn.execute("SELECT COUNT(*) FROM log_templates").fetchone()[0] if "log_templates" in [r[0] for r in conn.execute("SHOW TABLES").fetchall()] else 0
+    # Run Cross-Channel Correlation Indexing
+    corr_mgr = get_correlation_mgr()
+    corr_stats = corr_mgr.build_correlation_index(conn, canonical_table="canonical_logs")
+
+    all_tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
+    rec_count = conn.execute("SELECT COUNT(*) FROM canonical_logs").fetchone()[0] if "canonical_logs" in all_tables else 0
+    tpl_count = conn.execute("SELECT COUNT(*) FROM log_templates").fetchone()[0] if "log_templates" in all_tables else 0
     v_count = v_idx.client.count(v_idx.collection_name).count
+    corr_count = conn.execute("SELECT COUNT(*) FROM entity_correlations").fetchone()[0] if "entity_correlations" in all_tables else 0
 
     return {
         "records": rec_count,
         "templates": tpl_count,
         "vectors": v_count,
+        "correlations": corr_count,
         "drain_stats": drain_stats,
         "vector_stats": v_stats,
+        "corr_stats": corr_stats,
     }
 
 
@@ -923,6 +997,8 @@ def generate_chatgpt_forensic_response(
     scope_label: str,
     total_scope_records: int,
     conn: Optional[duckdb.DuckDBPyConnection] = None,
+    correlated_events: Optional[List[Dict[str, Any]]] = None,
+    anchor_record: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Generates an intelligent, ChatGPT-style conversational forensic analysis response
     centered strictly around the user's query and the statistics behind it.
@@ -1096,7 +1172,13 @@ def generate_chatgpt_forensic_response(
     resp = f"### 🔍 Forensic Findings\n\n"
 
     # Conversational opening directly answering the question
-    if qf.entity_filters.process_id:
+    if correlated_events and anchor_record:
+        a_rec = anchor_record.get("RecordID") or anchor_record.get("event_record_id") or "N/A"
+        a_eid = anchor_record.get("EventID") or anchor_record.get("event_id") or "N/A"
+        a_chan = anchor_record.get("Channel") or anchor_record.get("source_type") or "N/A"
+        a_desc = WINDOWS_EVENT_DESCRIPTIONS.get(str(a_eid), "Event")
+        resp += f"Cross-channel correlation around **Anchor Record `#{a_rec}` (Event {a_eid}: {a_desc} in {a_chan})** identified **{len(correlated_events):,} linked event(s)** across channels via shared session, process lineage, and security contexts.\n\n"
+    elif qf.entity_filters.process_id:
         proc_val = qf.entity_filters.process_id
         resp += f"Based on the analysis of **Process ID `{proc_val}`**, we identified **{match_cnt:,} canonical event(s)** in `{scope_label}`. "
         if ed_procs:
@@ -1123,6 +1205,33 @@ def generate_chatgpt_forensic_response(
     resp += "| ⚡ Severity Distribution | 🏷️ Top Event Distribution | 🗜️ Drain3 Deduplication |\n"
     resp += "| :--- | :--- | :--- |\n"
     resp += f"| {severity_str} | {top_eids_str} | **{tpl_count}** template(s) for **{match_cnt:,}** events<br>*({dedup_comp:.1f}% compression)* |\n\n"
+
+    # Cross-Channel Correlation & Causal Sequence Table (if correlated events present)
+    if correlated_events:
+        resp += "#### 🔗 Cross-Channel Correlation & Causal Sequence\n\n"
+        if anchor_record:
+            a_rec = anchor_record.get("RecordID") or anchor_record.get("event_record_id") or "N/A"
+            a_eid = anchor_record.get("EventID") or anchor_record.get("event_id") or "N/A"
+            a_chan = anchor_record.get("Channel") or anchor_record.get("source_type") or "N/A"
+            a_time = anchor_record.get("TimeCreated") or anchor_record.get("time_created_utc") or "N/A"
+            a_desc = WINDOWS_EVENT_DESCRIPTIONS.get(str(a_eid), "Event")
+            resp += f"⚓ **Anchor Event:** Record `#{a_rec}` • **Event {a_eid}** (*{a_desc}*) in `{a_chan}` at `{a_time}`\n\n"
+
+        resp += r"| Relative Time ($\Delta t$) | Channel | Event ID | Linked Entity | Confidence | Relation Reason |" + "\n"
+        resp += "| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+        for ce in correlated_events[:15]:
+            delta_str = ce.get("time_delta_str", "0s")
+            c_chan = ce.get("source_type", "-")
+            c_eid = ce.get("event_id", "-")
+            c_desc = WINDOWS_EVENT_DESCRIPTIONS.get(str(c_eid), "")
+            c_desc_str = f" (*{c_desc}*)" if c_desc else ""
+            c_ent = f"`{ce.get('entity_type')}: {ce.get('entity_value')}`"
+            c_conf = ce.get("confidence", "Medium")
+            c_reason = ce.get("relation_reason", "-")
+            resp += f"| **`{delta_str}`** | `{c_chan}` | **{c_eid}**{c_desc_str} | {c_ent} | `{c_conf}` | {c_reason} |\n"
+        if len(correlated_events) > 15:
+            resp += f"\n*...and {len(correlated_events) - 15} additional correlated event(s) in the Evidence Grid below.*\n\n"
+        resp += "\n"
 
     # Granular Technical Insights (Metadata & Payload Deep Dive)
     resp += "#### 🔎 Technical Details & Payload Highlights\n"
@@ -1163,7 +1272,9 @@ def generate_chatgpt_forensic_response(
         resp += f"- Events occurred across **{len(hosts)}** host(s) and **{len(all_users) or 1}** security context(s).\n"
 
     resp += "\n#### 🛡️ Forensic Assessment & Next Steps\n"
-    if qf.event_id == "4625" or "4625" in top_eids:
+    if correlated_events:
+        resp += "> 🔗 **Correlation Assessment:** Cross-channel linkage established temporal sequence and session bounds without altering original records. Review the sequence table above and full canonical rows below to reconstruct the causal incident flow.\n"
+    elif qf.event_id == "4625" or "4625" in top_eids:
         resp += "> ⚠️ **Security Advisory:** Logon failures detected. Correlate with subsequent Event 4624 (Successful Logon) from the same source IP or user within 15 minutes to identify brute-force or credential stuffing compromises.\n"
     elif "7" in top_eids or "disk" in str(records.get("Provider", "")).lower():
         resp += "> ⚠️ **System Reliability Advisory:** Device bad block / disk I/O errors detected. Validate physical drive health using SMART utilities and verify backup integrity immediately.\n"
@@ -1866,8 +1977,8 @@ elif st.session_state["active_tab"] == "viewer":
                             unsafe_allow_html=True,
                         )
 
-                        # Drawer Action Bar: Show raw XML | Show raw JSON | Close
-                        d_c1, d_c2, d_c3, _ = st.columns([1.3, 1.3, 1.0, 4.0])
+                        # Drawer Action Bar: Show raw XML | Show raw JSON | Correlate | Close
+                        d_c1, d_c2, d_c3, d_c4, _ = st.columns([1.3, 1.3, 2.2, 1.0, 2.2])
                         with d_c1:
                             xml_active = (st.session_state.get("raw_view_mode") == "xml")
                             btn_xml_label = "Hide raw XML" if xml_active else "Show raw XML"
@@ -1883,6 +1994,13 @@ elif st.session_state["active_tab"] == "viewer":
                                 st.rerun()
 
                         with d_c3:
+                            corr_active = (st.session_state.get("raw_view_mode") == "corr")
+                            btn_corr_label = "Hide Correlated" if corr_active else "🔗 Correlate Across Channels"
+                            if st.button(btn_corr_label, key=f"drawer_corr_{rec_id}", **stretch_kw()):
+                                st.session_state["raw_view_mode"] = None if corr_active else "corr"
+                                st.rerun()
+
+                        with d_c4:
                             if st.button("Close", key=f"drawer_close_{rec_id}", **stretch_kw()):
                                 st.session_state["expanded_record_id"] = None
                                 st.session_state["raw_view_mode"] = None
@@ -1903,6 +2021,44 @@ elif st.session_state["active_tab"] == "viewer":
                             raw_json_text = json.dumps(clean_rec, indent=2)
                             st.caption("Standard Structured JSON Record:")
                             st.code(raw_json_text, language="json")
+
+                        # Cross-Channel Correlated Events display
+                        elif st.session_state.get("raw_view_mode") == "corr":
+                            conn = get_duckdb_conn()
+                            all_tbls = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
+                            if "entity_correlations" in all_tbls:
+                                corrs = find_correlated(conn, anchor_event_record_id=rec_id, limit=25)
+                                if corrs:
+                                    st.markdown(f"##### 🔗 Correlated Events for Record `#{rec_id}` ({len(corrs):,} found)")
+                                    corr_df = pd.DataFrame(corrs)
+                                    disp_c = [c for c in ["time_delta_str", "source_type", "event_id", "entity_type", "entity_value", "confidence", "relation_reason"] if c in corr_df.columns]
+                                    corr_df_renamed = corr_df[disp_c].rename(columns={
+                                        "time_delta_str": "Time Offset (Δt)",
+                                        "source_type": "Channel",
+                                        "event_id": "Event ID",
+                                        "entity_type": "Linked Entity",
+                                        "entity_value": "Entity Value",
+                                        "confidence": "Confidence",
+                                        "relation_reason": "Relation",
+                                    })
+                                    st.dataframe(corr_df_renamed, **stretch_kw())
+
+                                    ask_col, _ = st.columns([3.0, 4.0])
+                                    with ask_col:
+                                        if st.button(f"💬 Ask Assistant: What else happened around record {rec_id}?", key=f"btn_ask_corr_{rec_id}", **stretch_kw()):
+                                            st.session_state["active_tab"] = "assistant"
+                                            st.session_state["chatbot_messages"].append({
+                                                "role": "user",
+                                                "content": f"What else happened around record {rec_id}?",
+                                                "evidence": None,
+                                                "filter_card": None,
+                                                "templates": None,
+                                            })
+                                            st.rerun()
+                                else:
+                                    st.info(f"No cross-channel correlated events found within temporal proximity windows for Record #{rec_id}.")
+                            else:
+                                st.info("Correlation index is not yet built in DuckDB. Open the **Forensic Assistant** tab to automatically index correlations.")
 
             # ------------------------------------------------------------------
             # 4. COLLAPSIBLE VISUAL ANALYTICS & METRICS
@@ -2037,11 +2193,15 @@ elif st.session_state["active_tab"] == "assistant":
         total_rec_count = 0
         total_tpl_count = 0
         total_vec_count = 0
+        total_corr_count = 0
         try:
             total_rec_count = conn.execute("SELECT COUNT(*) FROM canonical_logs").fetchone()[0]
             total_tpl_count = conn.execute("SELECT COUNT(*) FROM log_templates").fetchone()[0]
             v_idx = get_vector_index(get_embedder())
             total_vec_count = v_idx.client.count(v_idx.collection_name).count
+            all_tbls = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
+            if "entity_correlations" in all_tbls:
+                total_corr_count = conn.execute("SELECT COUNT(*) FROM entity_correlations").fetchone()[0]
         except Exception:
             pass
 
@@ -2053,19 +2213,22 @@ elif st.session_state["active_tab"] == "assistant":
         st.title("🤖 Windows Forensic Assistant")
         st.markdown(
             "Chat with your event logs using **natural language (NLP)**. "
-            "Powered by **Drain3 log clustering**, **BGE technical embeddings**, and **DuckDB canonical verification**."
+            "Powered by **Drain3 log clustering**, **BGE technical embeddings**, **DuckDB canonical verification**, "
+            "and **Cross-Channel Entity Correlation**."
         )
 
         # KPI Metrics Cards Banner
-        kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
+        kpi_col1, kpi_col2, kpi_col3, kpi_col4, kpi_col5 = st.columns(5)
         with kpi_col1:
-            st.metric("Investigation Scope", scope_label[:20] + ("..." if len(scope_label) > 20 else ""))
+            st.metric("Investigation Scope", scope_label[:18] + ("..." if len(scope_label) > 18 else ""))
         with kpi_col2:
             st.metric("Canonical Records", f"{total_rec_count:,}")
         with kpi_col3:
             st.metric("Drain3 Templates", f"{total_tpl_count:,}", delta=f"{dedup_ratio:.1f}% Dedup" if dedup_ratio > 0 else None)
         with kpi_col4:
             st.metric("Vector Index", f"🟢 {total_vec_count:,} Vectors")
+        with kpi_col5:
+            st.metric("Correlations", f"🔗 {total_corr_count:,} Links")
 
         # ----------------------------------------------------------------------
         # INTEGRATED CLUSTERED TEMPLATES & DEDUP EXPLORER (EXPANDABLE PANEL)
@@ -2132,6 +2295,78 @@ elif st.session_state["active_tab"] == "assistant":
             except Exception as e:
                 st.info(f"No templates currently loaded: {e}")
 
+        # ----------------------------------------------------------------------
+        # INTEGRATED CROSS-CHANNEL CORRELATION EXPLORER (EXPANDABLE PANEL)
+        # ----------------------------------------------------------------------
+        with st.expander("🔗 Cross-Channel Correlation Explorer & Causal Sequence Graph", expanded=False):
+            st.markdown(
+                "Link events across **Application**, **System**, and **Security** logs via shared entity identifiers "
+                "(Logon IDs, Activity GUIDs, User SIDs, Network IPs, and Process instances) within strict temporal proximity windows."
+            )
+
+            all_tbls_corr = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
+            if "entity_correlations" not in all_tbls_corr:
+                st.info("Correlation index is not yet built in DuckDB. Click **Re-Index Scope in DuckDB & Qdrant** in the sidebar to build.")
+            else:
+                corr_c1, corr_c2, corr_c3 = st.columns([2.2, 2.2, 1.2])
+                with corr_c1:
+                    anchor_input = st.text_input("Anchor Event Record ID:", placeholder="e.g. 100, 1204...", key="corr_panel_anchor")
+                with corr_c2:
+                    conf_options = [
+                        ("All Valid Entities (Weight >= 0.2)", 0.2),
+                        ("High Confidence Only (1.0) - Logon/Activity/PID Instance", 0.95),
+                        ("Medium-High (0.8+) - User SID", 0.75),
+                        ("Medium (0.6+) - IP Address", 0.55),
+                    ]
+                    sel_conf_idx = st.selectbox(
+                        "Minimum Confidence Filter:",
+                        options=range(len(conf_options)),
+                        format_func=lambda i: conf_options[i][0],
+                        index=0,
+                        key="corr_panel_min_conf",
+                    )
+                    min_conf_val = conf_options[sel_conf_idx][1]
+                with corr_c3:
+                    st.write("")
+                    st.write("")
+                    btn_run_corr = st.button("🔎 Trace Links", **stretch_kw())
+
+                if (btn_run_corr or anchor_input) and anchor_input.strip():
+                    clean_anchor = anchor_input.strip()
+                    corr_mgr = get_correlation_mgr()
+                    c_results = corr_mgr.find_correlated(
+                        conn=conn,
+                        anchor_event_record_id=clean_anchor,
+                        min_confidence_weight=min_conf_val,
+                        limit=50,
+                    )
+                    if c_results:
+                        st.markdown(f"##### 🎯 Found {len(c_results):,} Cross-Channel Event(s) Correlated with Record `#{clean_anchor}`")
+                        c_df = pd.DataFrame(c_results)
+                        disp_cols = [c for c in ["time_delta_str", "source_type", "event_id", "entity_type", "entity_value", "confidence", "relation_reason"] if c in c_df.columns]
+                        c_df_renamed = c_df[disp_cols].rename(columns={
+                            "time_delta_str": "Time Offset (Δt)",
+                            "source_type": "Channel",
+                            "event_id": "Event ID",
+                            "entity_type": "Linked Entity",
+                            "entity_value": "Entity Value",
+                            "confidence": "Confidence",
+                            "relation_reason": "Relation",
+                        })
+                        st.dataframe(c_df_renamed, **stretch_kw())
+
+                        if st.button(f"💬 Send to Chat Assistant: What else happened around record {clean_anchor}?", key=f"btn_corr_chat_{clean_anchor}", **stretch_kw()):
+                            st.session_state["chatbot_messages"].append({
+                                "role": "user",
+                                "content": f"What else happened around record {clean_anchor}?",
+                                "evidence": None,
+                                "filter_card": None,
+                                "templates": None,
+                            })
+                            st.rerun()
+                    else:
+                        st.info(f"No cross-channel correlated events found within temporal proximity windows for Record #{clean_anchor}.")
+
         st.markdown("---")
 
         # ----------------------------------------------------------------------
@@ -2140,7 +2375,7 @@ elif st.session_state["active_tab"] == "assistant":
         # Welcoming suggestions if chat is empty
         if not st.session_state.get("chatbot_messages") or len(st.session_state["chatbot_messages"]) <= 1:
             st.caption("✨ **Suggested prompts to get started:**")
-            sug_col1, sug_col2 = st.columns(2)
+            sug_col1, sug_col2, sug_col3 = st.columns(3)
             submitted_prompt = None
             with sug_col1:
                 if st.button("🔍 Logon failures for process 1064", **stretch_kw()):
@@ -2152,6 +2387,11 @@ elif st.session_state["active_tab"] == "assistant":
                     submitted_prompt = "Find USB reader disconnect events"
                 if st.button("⚡ Process creation and execution trace", **stretch_kw()):
                     submitted_prompt = "Show me process creation events"
+            with sug_col3:
+                if st.button("🔗 What else happened around process 1064?", **stretch_kw()):
+                    submitted_prompt = "What else happened around process 1064?"
+                if st.button("🔗 Correlated events for record 100", **stretch_kw()):
+                    submitted_prompt = "Show correlated events for record 100"
         else:
             submitted_prompt = None
 
@@ -2242,43 +2482,104 @@ elif st.session_state["active_tab"] == "assistant":
                     top_k=5,
                 )
 
-                # Step 4: Canonical DuckDB Execution
+                # Step 4: Canonical DuckDB Execution & Cross-Channel Correlation Routing
                 executor = get_query_executor()
-                has_metadata_filters = (
-                    qf.entity_filters.has_any() or
-                    bool(qf.event_id) or
-                    bool(qf.level) or
-                    bool(qf.source_type) or
-                    bool(qf.time_range)
+                corr_mgr = get_correlation_mgr()
+
+                is_correlation_query = (
+                    qf.intent == "correlation" or
+                    bool(qf.entity_filters.event_record_id) or
+                    "correlated" in active_query.lower() or
+                    "what else happened" in active_query.lower() or
+                    "around the time of" in active_query.lower() or
+                    "related events" in active_query.lower()
                 )
 
-                if has_metadata_filters:
-                    # Explicit metadata attributes present: DuckDB is primary source of truth
-                    matched_records = executor.execute_query(
-                        conn=conn,
-                        query_filter=qf,
-                        candidate_record_ids=None,
-                        canonical_table="canonical_logs",
-                        limit=500,
-                    )
+                correlated_results = None
+                anchor_record_data = None
+
+                if is_correlation_query:
+                    anchor_rec_id = None
+                    if qf.entity_filters.event_record_id:
+                        anchor_rec_id = str(qf.entity_filters.event_record_id).strip()
+                    else:
+                        # Find candidate anchor records matching the query parameters
+                        cand_df = executor.execute_query(
+                            conn=conn,
+                            query_filter=qf,
+                            candidate_record_ids=None,
+                            canonical_table="canonical_logs",
+                            limit=5,
+                        )
+                        if not cand_df.empty:
+                            rec_col_cand = "RecordID" if "RecordID" in cand_df.columns else "event_record_id"
+                            anchor_rec_id = str(cand_df.iloc[0][rec_col_cand]).replace(".0", "")
+
+                    if anchor_rec_id:
+                        rec_col_name = "RecordID" if "RecordID" in [c[0] for c in conn.execute("DESCRIBE canonical_logs").fetchall()] else "event_record_id"
+                        anchor_rows = conn.execute(
+                            f"SELECT * FROM canonical_logs WHERE REGEXP_REPLACE(CAST({rec_col_name} AS VARCHAR), '\\.0$', '') = ?",
+                            [anchor_rec_id],
+                        ).df()
+                        if not anchor_rows.empty:
+                            anchor_record_data = anchor_rows.iloc[0].to_dict()
+
+                        correlated_results = corr_mgr.find_correlated(
+                            conn=conn,
+                            anchor_event_record_id=anchor_rec_id,
+                            limit=100,
+                        )
+
+                        if correlated_results:
+                            corr_ids = [str(r["event_record_id"]).replace(".0", "") for r in correlated_results]
+                            all_ids_to_fetch = [anchor_rec_id] + corr_ids
+                            placeholders = ", ".join(["?"] * len(all_ids_to_fetch))
+                            matched_records = conn.execute(
+                                f"SELECT * FROM canonical_logs WHERE REGEXP_REPLACE(CAST({rec_col_name} AS VARCHAR), '\\.0$', '') IN ({placeholders})",
+                                all_ids_to_fetch,
+                            ).df()
+
+                            # Attach correlation metadata columns
+                            corr_map = {str(r["event_record_id"]).replace(".0", ""): r for r in correlated_results}
+                            def get_corr_delta(row):
+                                rid = str(row.get(rec_col_name, "")).replace(".0", "")
+                                if rid == anchor_rec_id:
+                                    return "0s (Anchor)"
+                                return corr_map.get(rid, {}).get("time_delta_str", "-")
+
+                            def get_corr_conf(row):
+                                rid = str(row.get(rec_col_name, "")).replace(".0", "")
+                                if rid == anchor_rec_id:
+                                    return "Anchor (1.0)"
+                                return corr_map.get(rid, {}).get("confidence", "-")
+
+                            def get_corr_reason(row):
+                                rid = str(row.get(rec_col_name, "")).replace(".0", "")
+                                if rid == anchor_rec_id:
+                                    return "Anchor Event"
+                                return corr_map.get(rid, {}).get("relation_reason", "-")
+
+                            matched_records.insert(0, "RelationReason", matched_records.apply(get_corr_reason, axis=1))
+                            matched_records.insert(0, "Confidence", matched_records.apply(get_corr_conf, axis=1))
+                            matched_records.insert(0, "TimeDelta", matched_records.apply(get_corr_delta, axis=1))
+                        elif not anchor_rows.empty:
+                            matched_records = anchor_rows
+                        else:
+                            matched_records = pd.DataFrame()
+                    else:
+                        matched_records = pd.DataFrame()
+
                 else:
-                    # Semantic query: intersect with vector candidate template instances
-                    candidate_rec_ids: List[str] = []
-                    if template_matches:
-                        inst_map = v_idx.resolve_search_results_to_instances(conn, template_matches)
-                        for ids in inst_map.values():
-                            candidate_rec_ids.extend(ids)
-
-                    matched_records = executor.execute_query(
-                        conn=conn,
-                        query_filter=qf,
-                        candidate_record_ids=candidate_rec_ids if candidate_rec_ids else None,
-                        canonical_table="canonical_logs",
-                        limit=500,
+                    has_metadata_filters = (
+                        qf.entity_filters.has_any() or
+                        bool(qf.event_id) or
+                        bool(qf.level) or
+                        bool(qf.source_type) or
+                        bool(qf.time_range)
                     )
 
-                    # Graceful fallback if vector intersection yielded no records
-                    if matched_records.empty:
+                    if has_metadata_filters:
+                        # Explicit metadata attributes present: DuckDB is primary source of truth
                         matched_records = executor.execute_query(
                             conn=conn,
                             query_filter=qf,
@@ -2286,6 +2587,31 @@ elif st.session_state["active_tab"] == "assistant":
                             canonical_table="canonical_logs",
                             limit=500,
                         )
+                    else:
+                        # Semantic query: intersect with vector candidate template instances
+                        candidate_rec_ids: List[str] = []
+                        if template_matches:
+                            inst_map = v_idx.resolve_search_results_to_instances(conn, template_matches)
+                            for ids in inst_map.values():
+                                candidate_rec_ids.extend(ids)
+
+                        matched_records = executor.execute_query(
+                            conn=conn,
+                            query_filter=qf,
+                            candidate_record_ids=candidate_rec_ids if candidate_rec_ids else None,
+                            canonical_table="canonical_logs",
+                            limit=500,
+                        )
+
+                        # Graceful fallback if vector intersection yielded no records
+                        if matched_records.empty:
+                            matched_records = executor.execute_query(
+                                conn=conn,
+                                query_filter=qf,
+                                candidate_record_ids=None,
+                                canonical_table="canonical_logs",
+                                limit=500,
+                            )
 
                 # Step 5: Synthesize ChatGPT-Style Conversational Forensic Response
                 resp_text = generate_chatgpt_forensic_response(
@@ -2296,6 +2622,8 @@ elif st.session_state["active_tab"] == "assistant":
                     scope_label=scope_label,
                     total_scope_records=total_rec_count,
                     conn=conn,
+                    correlated_events=correlated_results,
+                    anchor_record=anchor_record_data,
                 )
 
             st.session_state["chatbot_messages"].append(
