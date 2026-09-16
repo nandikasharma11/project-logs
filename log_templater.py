@@ -4,24 +4,69 @@
 DEDUPLICATION & TEMPLATING LAYER (Drain3 + DuckDB Traceability)
 ================================================================================
 Author: Principal Forensics Specialist & Data Systems Architect
-Description:
-    Derived search indexing layer between raw canonical DuckDB log records and
-    downstream vector/semantic search. Clusters high-volume near-identical log
-    entries into standardized templates using Drain3 streaming template mining
-    while guaranteeing non-negotiable evidentiary integrity:
 
-    1. Read-Only Canonical Store: Never writes to, modifies, or deletes records
-       in the canonical DuckDB table.
-    2. 100% Traceability: Every single event_record_id is mapped to exactly one
-       template in 'template_instances'. COUNT(template_instances) == COUNT(canonical).
-    3. Per-Channel Mining: Independent Drain3 miners partitioned by source_type
-       (Security, System, Application) with domain-specific regex maskers.
-    4. State Persistence: Miner state is persisted per channel across incremental
-       ingestion runs (no re-clustering from scratch).
-    5. Representative Document Generation: Emits one embeddable document per
-       template for downstream SecBERT/Qdrant vector indexing.
-    6. Idempotency: Re-running ingestion on existing records produces zero
-       duplicate templates or instances.
+ARCHITECTURE OVERVIEW:
+This layer sits between the raw canonical log records (preserved in DuckDB) and
+the downstream vector/semantic search and embedding pipeline. It addresses the
+fundamental challenge of forensic log analysis: 80-95% of enterprise Windows
+event logs are high-frequency, near-identical repetitive events (e.g., Event 4624
+logon bursts, Event 4625 brute-force attempts, or Event 7036 service heartbeats).
+Embedding every single log instance floods vector stores with redundant vectors
+and blows out token budgets.
+
+This module clusters redundant records into standardized templates using Drain3
+streaming parse trees, while strictly upholding non-negotiable EVIDENTIARY INTEGRITY:
+  - Canonical Store is Strictly Read-Only (SELECT queries only). Zero deletes/edits.
+  - 100% Traceability: Every single event_record_id is mapped to a template.
+    COUNT(template_instances) == COUNT(canonical_logs).
+  - No Sampling or Silent Truncation: Querying a template returns 100% of the
+    underlying raw records.
+
+DERIVED DUCKDB TABLES CREATED:
+--------------------------------------------------------------------------------
+1. 'log_templates' (Derived Template Summary):
+   - template_id        VARCHAR PRIMARY KEY (Deterministic cluster key: TPL_{CHANNEL}_{EVENTID}_{CLUSTER})
+   - source_type        VARCHAR NOT NULL    (Security | System | Application)
+   - provider           VARCHAR             (e.g., Microsoft-Windows-Security-Auditing)
+   - event_id           VARCHAR             (e.g., 4625)
+   - template_string    VARCHAR NOT NULL    (e.g., 'An account failed to log on with status <HEX> from IP <IP> for user <*>' )
+   - first_seen_utc     VARCHAR NOT NULL    (Timestamp of earliest occurrence)
+   - last_seen_utc      VARCHAR NOT NULL    (Timestamp of latest occurrence)
+   - total_count        BIGINT NOT NULL     (Exact count of log records matching this template)
+
+2. 'template_instances' (100% Evidentiary Traceability Mapping):
+   - event_record_id    VARCHAR PRIMARY KEY (Foreign key back to canonical record store)
+   - template_id        VARCHAR NOT NULL    (Foreign key to log_templates)
+   - time_created_utc   VARCHAR             (Denormalized for zero-join time range queries)
+   - extracted_variables VARCHAR            (JSON string of abstracted parameter values, e.g. {"0": "admin", "1": "10.0.0.1"})
+
+DOWNSTREAM CONSUMPTION GUIDE:
+--------------------------------------------------------------------------------
+How Downstream Stages MUST Consume This Layer:
+
+1. Stage 3 (Embedding Generation - SecBERT / BGE):
+   - Call `generate_representative_documents(conn)` to retrieve the list of
+     distinct template documents.
+   - Embed ONLY these representative documents (1 vector per template), rather
+     than 100,000 raw individual logs.
+   - Each document contains: Source channel, EventID, synthesized Event Family
+     label, Provider, and the standardized template string.
+
+2. Stage 4 (Vector Indexing - Qdrant):
+   - Upsert the template embeddings into Qdrant collection using `template_id`
+     as the point ID.
+   - Attach metadata payload (`source_type`, `event_id`, `provider`, `total_count`,
+     `first_seen_utc`, `last_seen_utc`).
+
+3. Stage 5 & 6 (Two-Pass Forensic Retrieval & RAG):
+   - PASS 1 (Semantic Candidate Discovery):
+     Perform dense/hybrid vector search against Qdrant to retrieve the top-k
+     most relevant `template_id`s for an investigator's natural language query.
+   - PASS 2 (Evidentiary Traceability & Full Record Fetch):
+     Given the top `template_id`s, query DuckDB via:
+       - `get_instances_for_template(conn, template_id)` -> Returns 100% of record IDs.
+       - `get_records_for_template(conn, template_id)`   -> Returns full 23-column raw records.
+     Pass the aggregated template context + exemplar records into the LLM for forensic synthesis.
 ================================================================================
 """
 
@@ -42,6 +87,70 @@ from drain3.masking import MaskingInstruction
 from drain3.template_miner_config import TemplateMinerConfig
 
 logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# 0. WINDOWS EVENT FAMILIES TAXONOMY
+# ==============================================================================
+
+WINDOWS_EVENT_FAMILIES: Dict[str, str] = {
+    # Security Channel - Authentication & Logon
+    "4624": "Successful Logon",
+    "4625": "Failed Logon",
+    "4634": "Account Logoff",
+    "4647": "User-Initiated Logoff",
+    "4648": "Logon with Explicit Credentials",
+    "4672": "Special Privileges Assigned to New Logon",
+    "4776": "Domain Controller Validated Credentials (NTLM)",
+    "4768": "Kerberos Authentication Ticket (TGT) Requested",
+    "4769": "Kerberos Service Ticket Requested",
+    "4771": "Kerberos Pre-Authentication Failed",
+    # Security Channel - Process & Execution Tracking
+    "4688": "A New Process Was Created",
+    "4689": "A Process Has Exited",
+    "4697": "A Service Was Installed in the System",
+    "4698": "A Scheduled Task Was Created",
+    "4699": "A Scheduled Task Was Deleted",
+    "4700": "A Scheduled Task Was Enabled",
+    "4702": "A Scheduled Task Was Updated",
+    # Security Channel - Account & Group Management
+    "4720": "A User Account Was Created",
+    "4722": "A User Account Was Enabled",
+    "4724": "An Attempt Was Made to Reset an Account Password",
+    "4726": "A User Account Was Deleted",
+    "4738": "A User Account Was Modified",
+    "4740": "A User Account Was Locked Out",
+    "4728": "A Member Was Added to a Security-Enabled Global Group",
+    "4732": "A Member Was Added to a Security-Enabled Local Group",
+    "4756": "A Member Was Added to a Security-Enabled Universal Group",
+    # Security Channel - Policy & Audit
+    "1102": "The Audit Log Was Cleared",
+    "4719": "System Audit Policy Was Changed",
+    # System Channel - Service & Lifecycle
+    "7036": "Service State Changed",
+    "7040": "Service Start Type Changed",
+    "7045": "A New Service Was Installed on the System",
+    "1074": "System Shutdown or Restart Initiated",
+    "6005": "Event Log Service Started",
+    "6006": "Event Log Service Stopped",
+    "6008": "The Previous System Shutdown Was Unexpected",
+    # Application Channel - Errors & Diagnostics
+    "1000": "Application Error (Crash)",
+    "1001": "Windows Error Reporting (WER)",
+    "1002": "Application Hang",
+}
+
+
+def get_event_family_label(event_id: str, source_type: str = "") -> str:
+    """Returns a short synthesized sentence or label describing the event family
+    (e.g., 'Event 4625: Failed Logon') derivable from the Windows Event ID.
+    """
+    clean_id = str(event_id).strip()
+    if clean_id in WINDOWS_EVENT_FAMILIES:
+        return f"Event {clean_id}: {WINDOWS_EVENT_FAMILIES[clean_id]}"
+    if source_type:
+        return f"{source_type} Event {clean_id}"
+    return f"Event {clean_id}"
 
 
 # ==============================================================================
@@ -81,19 +190,32 @@ class Drain3ChannelManager:
     def __init__(
         self,
         state_dir: str = ".drain3_state",
+        config_file: Optional[str] = "drain3.ini",
         sim_th: float = 0.4,
         depth: int = 4,
     ):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.config_file = config_file
         self.sim_th = sim_th
         self.depth = depth
         self.miners: Dict[str, TemplateMiner] = {}
         self.masking_instructions = get_forensic_masking_instructions()
 
     def _get_config(self) -> TemplateMinerConfig:
-        """Constructs a Drain3 configuration with domain masking and numeric parametrization."""
+        """Constructs a Drain3 configuration. Loads from config_file if present,
+        otherwise uses programmatic defaults and domain masking rules.
+        """
         config = TemplateMinerConfig()
+        if self.config_file and os.path.isfile(self.config_file):
+            try:
+                config.load(self.config_file)
+                if not config.masking_instructions:
+                    config.masking_instructions = self.masking_instructions
+                return config
+            except Exception as e:
+                logger.warning("Could not load config from %s: %s. Using defaults.", self.config_file, e)
+
         config.drain_sim_th = self.sim_th
         config.drain_depth = self.depth
         config.parametrize_numeric_tokens = True
@@ -506,16 +628,18 @@ class DuckDBTemplateManager:
             prov = str(row["provider"])
             tstr = str(row["template_string"])
             count = int(row["total_count"])
+            family_label = get_event_family_label(eid, stype)
 
             embed_text = (
-                f"[Source: {stype}] [EventID: {eid}] [Provider: {prov}] "
-                f"Template: {tstr}"
+                f"[Source: {stype}] [EventID: {eid}] [Family: {family_label}] "
+                f"[Provider: {prov}] Template: {tstr}"
             )
 
             meta = {
                 "template_id": tid,
                 "source_type": stype,
                 "event_id": eid,
+                "event_family": family_label,
                 "provider": prov,
                 "template_string": tstr,
                 "total_count": count,

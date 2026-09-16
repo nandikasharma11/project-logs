@@ -36,6 +36,7 @@ if PARENT_DIR not in sys.path:
 from log_templater import (
     Drain3ChannelManager,
     DuckDBTemplateManager,
+    get_event_family_label,
     get_forensic_masking_instructions,
 )
 
@@ -270,7 +271,7 @@ class TestLogTemplater(unittest.TestCase):
 
     def test_07_representative_document_generation(self):
         """Verify representative document generation for downstream vector index:
-        Produces 1 document per template containing template string and metadata.
+        Produces 1 document per template containing template string, event family, and metadata.
         """
         self._create_synthetic_canonical_logs(count=100)
         manager = DuckDBTemplateManager(state_dir=self.temp_state_dir)
@@ -287,10 +288,36 @@ class TestLogTemplater(unittest.TestCase):
         self.assertIn("text", doc0)
         self.assertIn("[Source:", doc0["text"])
         self.assertIn("[EventID:", doc0["text"])
+        self.assertIn("[Family:", doc0["text"])
         self.assertIn("Template:", doc0["text"])
         self.assertTrue(doc0["metadata"]["is_template_document"])
+        self.assertIn("event_family", doc0["metadata"])
         self.assertGreater(doc0["metadata"]["total_count"], 0)
+
+    def test_08_windows_event_family_labeling(self):
+        """Verify that known Windows security and system event IDs correctly derive
+        event family labels, with graceful fallback for unknown event IDs.
+        """
+        self.assertEqual(get_event_family_label("4625", "Security"), "Event 4625: Failed Logon")
+        self.assertEqual(get_event_family_label("4624", "Security"), "Event 4624: Successful Logon")
+        self.assertEqual(get_event_family_label("7036", "System"), "Event 7036: Service State Changed")
+        self.assertEqual(get_event_family_label("1000", "Application"), "Event 1000: Application Error (Crash)")
+        self.assertEqual(get_event_family_label("99999", "Security"), "Security Event 99999")
+        self.assertEqual(get_event_family_label("88888"), "Event 88888")
+
+    def test_09_drain3_ini_config_loading(self):
+        """Verify that Drain3ChannelManager correctly loads configuration parameters
+        and masking instructions from drain3.ini if present.
+        """
+        ini_path = os.path.join(PARENT_DIR, "drain3.ini")
+        if os.path.exists(ini_path):
+            chan_mgr = Drain3ChannelManager(state_dir=self.temp_state_dir, config_file=ini_path)
+            config = chan_mgr._get_config()
+            self.assertEqual(config.drain_sim_th, 0.4)
+            self.assertEqual(config.drain_depth, 4)
+            self.assertEqual(len(config.masking_instructions), 6)
 
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
