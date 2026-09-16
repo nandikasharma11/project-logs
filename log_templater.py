@@ -303,12 +303,21 @@ class DuckDBTemplateManager:
                 source_type VARCHAR NOT NULL,
                 provider VARCHAR,
                 event_id VARCHAR,
+                level VARCHAR DEFAULT 'Information',
                 template_string VARCHAR NOT NULL,
                 first_seen_utc VARCHAR NOT NULL,
                 last_seen_utc VARCHAR NOT NULL,
                 total_count BIGINT NOT NULL DEFAULT 1
             );
         """)
+
+        # Ensure level column exists if table was previously created without it
+        try:
+            cols = [r[0].lower() for r in conn.execute(f"DESCRIBE {self.TABLE_TEMPLATES}").fetchall()]
+            if "level" not in cols:
+                conn.execute(f"ALTER TABLE {self.TABLE_TEMPLATES} ADD COLUMN level VARCHAR DEFAULT 'Information'")
+        except Exception:
+            pass
 
         conn.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.TABLE_INSTANCES} (
@@ -373,6 +382,7 @@ class DuckDBTemplateManager:
         chan_col = col_map.get("source_type") or "source_type"
         prov_col = col_map.get("provider") or "provider"
         evid_col = col_map.get("event_id") or "event_id"
+        lvl_col = col_map.get("level")
         time_col = col_map.get("time_created_utc") or "time_created_utc"
         msg_col = col_map.get("message")
         ed_col = col_map.get("event_data")
@@ -401,14 +411,19 @@ class DuckDBTemplateManager:
         template_updates: Dict[str, Dict[str, Any]] = {}
 
         # Fetch existing templates for fast cache lookups
-        existing_tpls = conn.execute(f"SELECT template_id, template_string, first_seen_utc, last_seen_utc, total_count FROM {self.TABLE_TEMPLATES}").df()
+        existing_tpls = conn.execute(f"SELECT template_id, template_string, level, first_seen_utc, last_seen_utc, total_count FROM {self.TABLE_TEMPLATES}").df()
         existing_tpl_map = {row["template_id"]: row.to_dict() for _, row in existing_tpls.iterrows()}
+
+        sev_rank = {"Critical": 4, "Error": 3, "Warning": 2, "Information": 1, "Verbose": 0}
 
         for _, row in unmapped_df.iterrows():
             rec_id = str(row[rec_col]).strip()
             source_type = str(row.get(chan_col) or "Unknown").strip().capitalize()
             provider = str(row.get(prov_col) or "Unknown").strip() if prov_col else "Unknown"
             event_id = str(row.get(evid_col) or "0").strip() if evid_col else "0"
+            raw_level = str(row.get(lvl_col) or "Information").strip().capitalize() if lvl_col else "Information"
+            if not raw_level or raw_level.lower() in ("none", "nan", "null"):
+                raw_level = "Information"
             time_created = str(row.get(time_col) or "").strip()
 
             # Format log text: prioritize Message, then EventData
@@ -438,6 +453,8 @@ class DuckDBTemplateManager:
             if template_id in template_updates:
                 t_entry = template_updates[template_id]
                 t_entry["total_count"] += 1
+                if sev_rank.get(raw_level, 1) > sev_rank.get(t_entry.get("level", "Information"), 1):
+                    t_entry["level"] = raw_level
                 if time_created:
                     if not t_entry["first_seen_utc"] or time_created < t_entry["first_seen_utc"]:
                         t_entry["first_seen_utc"] = time_created
@@ -448,6 +465,9 @@ class DuckDBTemplateManager:
                 e_entry = existing_tpl_map[template_id]
                 first_seen = e_entry["first_seen_utc"]
                 last_seen = e_entry["last_seen_utc"]
+                curr_level = e_entry.get("level") or "Information"
+                if sev_rank.get(raw_level, 1) > sev_rank.get(curr_level, 1):
+                    curr_level = raw_level
                 if time_created:
                     if not first_seen or time_created < first_seen:
                         first_seen = time_created
@@ -458,6 +478,7 @@ class DuckDBTemplateManager:
                     "source_type": source_type,
                     "provider": provider,
                     "event_id": event_id,
+                    "level": curr_level,
                     "template_string": template_str,
                     "first_seen_utc": first_seen or time_created,
                     "last_seen_utc": last_seen or time_created,
@@ -470,6 +491,7 @@ class DuckDBTemplateManager:
                     "source_type": source_type,
                     "provider": provider,
                     "event_id": event_id,
+                    "level": raw_level,
                     "template_string": template_str,
                     "first_seen_utc": time_created,
                     "last_seen_utc": time_created,
@@ -492,15 +514,16 @@ class DuckDBTemplateManager:
                 conn.execute(
                     f"""
                     INSERT INTO {self.TABLE_TEMPLATES} (
-                        template_id, source_type, provider, event_id,
+                        template_id, source_type, provider, event_id, level,
                         template_string, first_seen_utc, last_seen_utc, total_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         tinfo["template_id"],
                         tinfo["source_type"],
                         tinfo["provider"],
                         tinfo["event_id"],
+                        tinfo["level"],
                         tinfo["template_string"],
                         tinfo["first_seen_utc"],
                         tinfo["last_seen_utc"],
@@ -513,6 +536,7 @@ class DuckDBTemplateManager:
                     f"""
                     UPDATE {self.TABLE_TEMPLATES}
                     SET template_string = ?,
+                        level = ?,
                         first_seen_utc = LEAST(first_seen_utc, ?),
                         last_seen_utc = GREATEST(last_seen_utc, ?),
                         total_count = ?
@@ -520,6 +544,7 @@ class DuckDBTemplateManager:
                     """,
                     [
                         tinfo["template_string"],
+                        tinfo["level"],
                         tinfo["first_seen_utc"],
                         tinfo["last_seen_utc"],
                         tinfo["total_count"],
@@ -611,6 +636,7 @@ class DuckDBTemplateManager:
                 source_type, 
                 provider, 
                 event_id, 
+                level,
                 template_string, 
                 first_seen_utc, 
                 last_seen_utc, 
@@ -626,21 +652,23 @@ class DuckDBTemplateManager:
             stype = str(row["source_type"])
             eid = str(row["event_id"])
             prov = str(row["provider"])
+            lvl = str(row.get("level") or "Information").strip().capitalize()
             tstr = str(row["template_string"])
             count = int(row["total_count"])
             family_label = get_event_family_label(eid, stype)
 
             embed_text = (
-                f"[Source: {stype}] [EventID: {eid}] [Family: {family_label}] "
+                f"[Source: {stype}] [Level: {lvl}] [EventID: {eid}] [Family: {family_label}] "
                 f"[Provider: {prov}] Template: {tstr}"
             )
 
             meta = {
                 "template_id": tid,
                 "source_type": stype,
-                "event_id": eid,
-                "event_family": family_label,
                 "provider": prov,
+                "event_id": eid,
+                "level": lvl,
+                "event_family": family_label,
                 "template_string": tstr,
                 "total_count": count,
                 "first_seen_utc": str(row["first_seen_utc"]),

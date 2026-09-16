@@ -287,10 +287,12 @@ class TestLogTemplater(unittest.TestCase):
         self.assertIn("template_id", doc0)
         self.assertIn("text", doc0)
         self.assertIn("[Source:", doc0["text"])
+        self.assertIn("[Level:", doc0["text"])
         self.assertIn("[EventID:", doc0["text"])
         self.assertIn("[Family:", doc0["text"])
         self.assertIn("Template:", doc0["text"])
         self.assertTrue(doc0["metadata"]["is_template_document"])
+        self.assertIn("level", doc0["metadata"])
         self.assertIn("event_family", doc0["metadata"])
         self.assertGreater(doc0["metadata"]["total_count"], 0)
 
