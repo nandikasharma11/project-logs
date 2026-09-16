@@ -786,7 +786,14 @@ def load_log_data(filepath: str) -> pd.DataFrame:
 @st.cache_resource
 def get_duckdb_conn() -> duckdb.DuckDBPyConnection:
     """Provides a shared, persistent DuckDB connection for canonical forensic storage."""
-    conn = duckdb.connect("forensic_logs.duckdb")
+    db_path = os.environ.get("FORENSIC_DUCKDB_PATH", "forensic_logs.duckdb")
+    try:
+        conn = duckdb.connect(db_path)
+    except Exception:
+        try:
+            conn = duckdb.connect(db_path, read_only=True)
+        except Exception:
+            conn = duckdb.connect(":memory:")
     return conn
 
 
@@ -805,7 +812,13 @@ def get_embedder() -> TemplateEmbedder:
 @st.cache_resource
 def get_vector_index(_embedder: TemplateEmbedder) -> TemplateVectorIndex:
     """Initializes and caches the Qdrant vector index stored in ./qdrant_storage."""
-    return TemplateVectorIndex(embedder=_embedder, storage_path="./qdrant_storage")
+    storage_path = os.environ.get("FORENSIC_QDRANT_STORAGE", "./qdrant_storage")
+    try:
+        return TemplateVectorIndex(embedder=_embedder, storage_path=storage_path)
+    except Exception:
+        import tempfile
+        tmp_dir = os.path.join(tempfile.gettempdir(), f"qdrant_local_{os.getpid()}")
+        return TemplateVectorIndex(embedder=_embedder, storage_path=tmp_dir)
 
 
 @st.cache_resource
@@ -2146,40 +2159,6 @@ elif st.session_state["active_tab"] == "assistant":
             avatar_icon = "🧑‍💻" if msg["role"] == "user" else "✨"
             with st.chat_message(msg["role"], avatar=avatar_icon):
                 st.markdown(msg["content"])
-
-                # Render Filter Resolution Card
-                f_card = msg.get("filter_card")
-                if f_card:
-                    with st.expander("⚙️ Structured NLP Filter Breakdown", expanded=False):
-                        fc1, fc2, fc3 = st.columns(3)
-                        with fc1:
-                            st.markdown(f"**Intent:** `{f_card.get('intent', 'N/A')}`")
-                            st.markdown(f"**Channel:** `{f_card.get('source_type') or 'All Channels'}`")
-                        with fc2:
-                            st.markdown(f"**Event ID:** `{f_card.get('event_id') or 'None'}`")
-                            st.markdown(f"**Level:** `{f_card.get('level') or 'Any'}`")
-                        with fc3:
-                            st.markdown(f"**Time Range:** `{f_card.get('time_range') or 'Unbounded'}`")
-                            st.markdown(f"**Entities:** `{f_card.get('entities') or 'None'}`")
-                        st.markdown(f"**Residual Semantic Query:** *\"{f_card.get('semantic_query', '')}\"*")
-
-                # Render Matched Templates Expander
-                tpl_matches = msg.get("templates")
-                if tpl_matches:
-                    with st.expander(f"🧩 Matching Drain3 Templates ({len(tpl_matches)} clusters)", expanded=False):
-                        tpl_display = []
-                        for t in tpl_matches:
-                            meta = t.get("metadata", {})
-                            tpl_display.append({
-                                "Score": round(float(t.get("score", 0.0)), 3),
-                                "Template ID": t.get("template_id"),
-                                "Channel": meta.get("source_type"),
-                                "Event ID": meta.get("event_id"),
-                                "Level": meta.get("level"),
-                                "Count": meta.get("total_count"),
-                                "Template String": meta.get("template_string"),
-                            })
-                        st.dataframe(pd.DataFrame(tpl_display), **stretch_kw())
 
                 # Render Evidence Artifacts Grid
                 ev_df = msg.get("evidence")
