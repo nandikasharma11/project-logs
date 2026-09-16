@@ -496,6 +496,8 @@ class TemplateVectorIndex:
 
         return results
 
+    search_templates = search
+
     def resolve_search_results_to_records(
         self,
         conn: duckdb.DuckDBPyConnection,

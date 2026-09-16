@@ -35,3 +35,6 @@ Thumbs.db
 
 # Storage & Vector DB
 qdrant_storage/
+*.duckdb
+*.duckdb.wal
+.drain3_state/

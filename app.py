@@ -31,6 +31,12 @@ import streamlit as st
 
 import fileconversion
 
+import duckdb
+from log_templater import DuckDBTemplateManager, Drain3ChannelManager, get_event_family_label
+from stage3_vectorizing import TemplateEmbedder, TemplateVectorIndex, construct_representative_text
+from query_parser import ForensicQueryParser, QueryFilter, TimeRange
+from query_executor import EventQueryExecutor
+
 try:
     importlib.reload(fileconversion)
 except Exception:
@@ -712,29 +718,129 @@ def load_log_data(filepath: str) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------------------
+# STAGE 3 FORENSIC CACHED ENGINES & DUCKDB SYNC
+# ------------------------------------------------------------------------------
+
+@st.cache_resource
+def get_duckdb_conn() -> duckdb.DuckDBPyConnection:
+    """Provides a shared, persistent DuckDB connection for canonical forensic storage."""
+    conn = duckdb.connect("forensic_logs.duckdb")
+    return conn
+
+
+@st.cache_resource
+def get_drain3_mgr() -> DuckDBTemplateManager:
+    """Provides the multi-channel Drain3 clustering and template manager."""
+    return DuckDBTemplateManager(state_dir=".drain3_state")
+
+
+@st.cache_resource
+def get_embedder() -> TemplateEmbedder:
+    """Loads and caches the technical template embedding model (BAAI/bge-small-en-v1.5)."""
+    return TemplateEmbedder(model_name="BAAI/bge-small-en-v1.5")
+
+
+@st.cache_resource
+def get_vector_index(_embedder: TemplateEmbedder) -> TemplateVectorIndex:
+    """Initializes and caches the Qdrant vector index stored in ./qdrant_storage."""
+    return TemplateVectorIndex(embedder=_embedder, storage_path="./qdrant_storage")
+
+
+@st.cache_resource
+def get_query_parser() -> ForensicQueryParser:
+    """Provides the NLP forensic query parser and intent router."""
+    return ForensicQueryParser()
+
+
+@st.cache_resource
+def get_query_executor() -> EventQueryExecutor:
+    """Provides the unified DuckDB SQL and JSON query executor."""
+    return EventQueryExecutor()
+
+
+def sync_dataframe_to_duckdb(
+    conn: duckdb.DuckDBPyConnection,
+    df: pd.DataFrame,
+    scope_key: str,
+    force_resync: bool = False,
+) -> Dict[str, Any]:
+    """Syncs DataFrame into DuckDB canonical_logs, clusters with Drain3, and indexes templates in Qdrant."""
+    if df.empty:
+        return {"records": 0, "templates": 0, "vectors": 0, "drain_stats": {}, "vector_stats": {}}
+
+    tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
+    table_exists = "canonical_logs" in tables
+
+    if not table_exists or force_resync:
+        conn.execute("DROP TABLE IF EXISTS canonical_logs")
+        conn.register("df_temp_ingest", df)
+        conn.execute("CREATE TABLE canonical_logs AS SELECT * FROM df_temp_ingest")
+        conn.unregister("df_temp_ingest")
+    else:
+        rec_col = "RecordID" if "RecordID" in df.columns else ("event_record_id" if "event_record_id" in df.columns else df.columns[0])
+        conn.register("df_temp_ingest", df)
+        try:
+            cols = [r[0] for r in conn.execute("DESCRIBE canonical_logs").fetchall()]
+            common_cols = [c for c in cols if c in df.columns]
+            cols_sql = ", ".join(f'"{c}"' for c in common_cols)
+            conn.execute(f"""
+                INSERT INTO canonical_logs ({cols_sql})
+                SELECT {cols_sql} FROM df_temp_ingest
+                WHERE CAST("{rec_col}" AS VARCHAR) NOT IN (SELECT CAST("{rec_col}" AS VARCHAR) FROM canonical_logs)
+            """)
+        except Exception:
+            pass
+        finally:
+            conn.unregister("df_temp_ingest")
+
+    # Run Drain3 clustering
+    mgr = get_drain3_mgr()
+    drain_stats = mgr.process_canonical_records(conn, canonical_table="canonical_logs")
+
+    # Run Qdrant Vector Indexing
+    embedder = get_embedder()
+    v_idx = get_vector_index(embedder)
+    v_stats = v_idx.index_from_duckdb(conn, templates_table="log_templates")
+
+    rec_count = conn.execute("SELECT COUNT(*) FROM canonical_logs").fetchone()[0]
+    tpl_count = conn.execute("SELECT COUNT(*) FROM log_templates").fetchone()[0]
+    v_count = v_idx.client.count(v_idx.collection_name).count
+
+    return {
+        "records": rec_count,
+        "templates": tpl_count,
+        "vectors": v_count,
+        "drain_stats": drain_stats,
+        "vector_stats": v_stats,
+    }
+
+
+# ------------------------------------------------------------------------------
 # SIDEBAR: NAVIGATION & CONTROLS
 # ------------------------------------------------------------------------------
 
 st.sidebar.title("Windows Event Logs")
 st.sidebar.subheader("Navigation")
 
-current_nav_idx = 0
-if st.session_state.get("active_tab") == "viewer":
-    current_nav_idx = 1
-elif st.session_state.get("active_tab") == "chatbot":
-    current_nav_idx = 2
+tab_keys = ["converter", "viewer", "chatbot", "templates"]
+tab_options = [
+    "🔄 Convert EVTX (Multi-Format)",
+    "📊 Forensic Grid & Inspector",
+    "🔍 NLP Forensic Search & AI Assistant",
+    "🧩 Clustered Templates & Dedup (Drain3)",
+]
+key_to_idx = {k: i for i, k in enumerate(tab_keys)}
+
+curr_key = st.session_state.get("active_tab", "converter")
+curr_idx = key_to_idx.get(curr_key, 0)
 
 page_selection = st.sidebar.radio(
     "Choose Mode:",
-    options=["🔄 Convert EVTX (Multi-Format)", "📊 Forensic Grid & Inspector", "🤖 Forensic AI Chatbot"],
-    index=current_nav_idx,
+    options=tab_options,
+    index=curr_idx,
 )
-if page_selection == "🔄 Convert EVTX (Multi-Format)":
-    st.session_state["active_tab"] = "converter"
-elif page_selection == "📊 Forensic Grid & Inspector":
-    st.session_state["active_tab"] = "viewer"
-else:
-    st.session_state["active_tab"] = "chatbot"
+sel_idx = tab_options.index(page_selection)
+st.session_state["active_tab"] = tab_keys[sel_idx]
 
 st.sidebar.markdown("---")
 st.sidebar.caption("⚡ **Engine:** `evtx_dump` + `python-evtx` fallback")
@@ -1484,15 +1590,15 @@ elif st.session_state["active_tab"] == "viewer":
 
 
 # ==============================================================================
-# VIEW 3: FORENSIC AI CHATBOT
+# VIEW 3: FORENSIC NLP SEARCH & AI ASSISTANT (STAGE 3)
 # ==============================================================================
 
 elif st.session_state["active_tab"] == "chatbot":
-    st.title("🤖 Windows Forensic AI Investigation Assistant")
+    st.title("🔍 Windows Forensic NLP Search & AI Assistant")
     st.markdown(
-        "Interactive natural language threat hunter and DFIR log analyst. "
-        "Ask questions across your converted logs to correlate events, detect anomalies, "
-        "and inspect raw forensic artifacts."
+        "Interactive natural language threat hunter and DFIR forensic search engine. "
+        "Type questions in plain English to extract structured forensic filters, match Drain3 "
+        "log templates via dense vector search, and retrieve canonical evidence with 100% evidentiary integrity."
     )
 
     # 1. Discover available logs
@@ -1527,19 +1633,24 @@ elif st.session_state["active_tab"] == "chatbot":
             help="Choose an individual log file or query across all converted logs simultaneously.",
         )
 
-        # Clear Chat Button
-        if st.sidebar.button("🗑️ Clear Chat History", **stretch_kw()):
+        force_resync = st.sidebar.button("🔄 Re-Index Scope in DuckDB & Qdrant", **stretch_kw())
+
+        if st.sidebar.button("🗑️ Clear Investigation History", **stretch_kw()):
             st.session_state["chatbot_messages"] = [
                 {
                     "role": "assistant",
-                    "content": "🧹 **Investigation history cleared.** Ready for a new query.",
+                    "content": "🧹 **Investigation history cleared.** Ready for a new forensic NLP query.",
+                    "filter_card": None,
+                    "templates": None,
                     "evidence": None,
                 }
             ]
             st.rerun()
 
-        # Load data based on selected scope
-        with st.spinner("Loading log data into investigation workspace..."):
+        # Connect to DuckDB and sync records
+        conn = get_duckdb_conn()
+
+        with st.spinner("Loading log data and synchronizing with DuckDB & Drain3 templater..."):
             if selected_log_name == "All Converted Logs (Consolidated)":
                 dfs = []
                 for fn, fp in file_options.items():
@@ -1553,19 +1664,59 @@ elif st.session_state["active_tab"] == "chatbot":
                 active_df = load_log_data(file_options[selected_log_name])
                 scope_label = selected_log_name
 
+            # Ingest and cluster into DuckDB
+            if not active_df.empty:
+                last_synced = st.session_state.get("synced_scope")
+                if last_synced != scope_label or force_resync:
+                    sync_res = sync_dataframe_to_duckdb(conn, active_df, scope_label, force_resync=force_resync)
+                    st.session_state["synced_scope"] = scope_label
+                    st.session_state["sync_res"] = sync_res
+
+        # Retrieve DB metrics
+        total_rec_count = 0
+        total_tpl_count = 0
+        total_vec_count = 0
+        try:
+            total_rec_count = conn.execute("SELECT COUNT(*) FROM canonical_logs").fetchone()[0]
+            total_tpl_count = conn.execute("SELECT COUNT(*) FROM log_templates").fetchone()[0]
+            v_idx = get_vector_index(get_embedder())
+            total_vec_count = v_idx.client.count(v_idx.collection_name).count
+        except Exception:
+            pass
+
+        dedup_ratio = 0.0
+        if total_rec_count > 0 and total_tpl_count > 0:
+            dedup_ratio = max(0.0, (1.0 - (total_tpl_count / total_rec_count)) * 100.0)
+
         # KPI Metrics Cards
         kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
         with kpi_col1:
             st.metric("Investigation Scope", scope_label[:20] + ("..." if len(scope_label) > 20 else ""))
         with kpi_col2:
-            st.metric("Records Analyzed", f"{len(active_df):,}")
+            st.metric("Canonical Records", f"{total_rec_count:,}")
         with kpi_col3:
-            unique_ids = active_df["EventID"].nunique() if "EventID" in active_df.columns else 0
-            st.metric("Unique Event IDs", f"{unique_ids:,}")
+            st.metric("Drain3 Templates", f"{total_tpl_count:,}", delta=f"{dedup_ratio:.1f}% Dedup" if dedup_ratio > 0 else None)
         with kpi_col4:
-            st.metric("Analyst Status", "🟢 Ready")
+            st.metric("Vector Index", f"🟢 {total_vec_count:,} Vectors")
 
         st.markdown("---")
+
+        # Suggestion Chips
+        st.caption("💡 **Quick Examples (Click to query):**")
+        ex_cols = st.columns(4)
+        submitted_example = None
+        with ex_cols[0]:
+            if st.button("🔍 Logon failures for process 1064", **stretch_kw()):
+                submitted_example = "Show me logon failure events for process 1064 yesterday"
+        with ex_cols[1]:
+            if st.button("🛡️ Critical errors in System log", **stretch_kw()):
+                submitted_example = "What critical errors occurred in System log?"
+        with ex_cols[2]:
+            if st.button("🔌 USB reader disconnects", **stretch_kw()):
+                submitted_example = "Find USB reader disconnect events"
+        with ex_cols[3]:
+            if st.button("⚡ Process creation audit", **stretch_kw()):
+                submitted_example = "Show me process creation events"
 
         # Chat History Display
         for idx, msg in enumerate(st.session_state["chatbot_messages"]):
@@ -1573,53 +1724,301 @@ elif st.session_state["active_tab"] == "chatbot":
             with st.chat_message(msg["role"], avatar=avatar_icon):
                 st.markdown(msg["content"])
 
-                # If this message has evidence attached, render the evidence inspector
+                # Render Filter Resolution Card if present
+                f_card = msg.get("filter_card")
+                if f_card:
+                    with st.expander("⚙️ Structured NLP Filter Breakdown", expanded=False):
+                        fc_col1, fc_col2, fc_col3 = st.columns(3)
+                        with fc_col1:
+                            st.markdown(f"**Intent:** `{f_card.get('intent', 'N/A')}`")
+                            st.markdown(f"**Channel:** `{f_card.get('source_type') or 'All Channels'}`")
+                        with fc_col2:
+                            st.markdown(f"**Event ID:** `{f_card.get('event_id') or 'None'}`")
+                            st.markdown(f"**Level:** `{f_card.get('level') or 'Any'}`")
+                        with fc_col3:
+                            st.markdown(f"**Time Range:** `{f_card.get('time_range') or 'Unbounded'}`")
+                            st.markdown(f"**Entities:** `{f_card.get('entities') or 'None'}`")
+                        st.markdown(f"**Residual Semantic Query:** *\"{f_card.get('semantic_query', '')}\"*")
+
+                # Render Matched Templates Expander if present
+                tpl_matches = msg.get("templates")
+                if tpl_matches:
+                    with st.expander(f"🧩 Matching Drain3 Templates ({len(tpl_matches)} clusters)", expanded=False):
+                        tpl_display = []
+                        for t in tpl_matches:
+                            meta = t.get("metadata", {})
+                            tpl_display.append({
+                                "Score": round(float(t.get("score", 0.0)), 3),
+                                "Template ID": t.get("template_id"),
+                                "Channel": meta.get("source_type"),
+                                "Event ID": meta.get("event_id"),
+                                "Level": meta.get("level"),
+                                "Count": meta.get("total_count"),
+                                "Template String": meta.get("template_string"),
+                            })
+                        st.dataframe(pd.DataFrame(tpl_display), **stretch_kw())
+
+                # Render Evidence Table if present
                 ev_df = msg.get("evidence")
                 if ev_df is not None and not ev_df.empty:
-                    with st.expander(f"🔎 Evidence Artifacts ({len(ev_df):,} matching events)", expanded=False):
-                        preview_cols = [
-                            c for c in ["TimeCreated", "EventID", "LevelName", "Channel", "Computer", "UserID", "Message"]
+                    with st.expander(f"🔎 Evidence Artifacts ({len(ev_df):,} matching events)", expanded=True):
+                        pref_cols = [
+                            c for c in ["RecordID", "event_record_id", "TimeCreated", "time_created_utc", "LevelName", "Level", "level", "EventID", "event_id", "Channel", "source_type", "Computer", "computer", "ProcessID", "process_id", "UserID", "user_id", "Message", "message"]
                             if c in ev_df.columns
                         ]
-                        if not preview_cols:
-                            preview_cols = list(ev_df.columns[:6])
-
-                        st.dataframe(ev_df[preview_cols].head(250), **stretch_kw())
+                        display_cols = pref_cols if pref_cols else list(ev_df.columns[:8])
+                        st.dataframe(ev_df[display_cols].head(250), **stretch_kw())
 
                         # Download matched evidence
-                        csv_evidence = ev_df.to_csv(index=False).encode("utf-8")
+                        ev_csv = ev_df.to_csv(index=False).encode("utf-8")
                         st.download_button(
                             label="📥 Download Evidence as CSV",
-                            data=csv_evidence,
+                            data=ev_csv,
                             file_name=f"forensic_evidence_{idx}.csv",
                             mime="text/csv",
-                            key=f"btn_dl_ev_{idx}",
+                            key=f"btn_dl_evidence_{idx}",
                         )
 
         # User Chat Input
-        user_query = st.chat_input("Ask a forensic question about the logs...")
+        user_input = st.chat_input("Ask a forensic question about the logs...")
+        active_query = submitted_example or user_input
 
         # Process query if submitted
-        if user_query:
-            # Append user message
+        if active_query:
             st.session_state["chatbot_messages"].append(
-                {"role": "user", "content": user_query, "evidence": None}
+                {"role": "user", "content": active_query, "evidence": None, "filter_card": None, "templates": None}
             )
 
-            # Analyze query against active dataset
-            with st.spinner("Analyzing event records and correlating artifacts..."):
-                resp_text, matched_evidence = analyze_forensic_query(
-                    query=user_query,
-                    df=active_df,
-                    source_label=scope_label,
+            with st.spinner("Parsing query, searching vector index, and executing DuckDB lookup..."):
+                # Step 1: Parse NLP query
+                parser = get_query_parser()
+                qf = parser.parse_query(active_query)
+
+                # Prepare structured filter summary
+                time_range_str = f"{qf.time_range.start_utc} to {qf.time_range.end_utc} (UTC)" if qf.time_range else "Unbounded"
+                entities_str = ", ".join(f"{k}={v}" for k, v in qf.entity_filters.to_dict().items() if v) or "None"
+
+                filter_card = {
+                    "intent": qf.intent,
+                    "source_type": qf.source_type,
+                    "event_id": qf.event_id,
+                    "level": qf.level,
+                    "time_range": time_range_str,
+                    "entities": entities_str,
+                    "semantic_query": qf.semantic_query,
+                }
+
+                # Step 2: Pass 1 Vector Search on Templates with pre-filtering
+                v_idx = get_vector_index(get_embedder())
+                qdrant_filters: Dict[str, Any] = {}
+                if qf.source_type:
+                    qdrant_filters["source_type"] = qf.source_type
+                if qf.level:
+                    qdrant_filters["level"] = qf.level
+                if qf.event_id:
+                    qdrant_filters["event_id"] = qf.event_id
+                if qf.time_range:
+                    qdrant_filters["time_range"] = {"start_time": qf.time_range.start_utc, "end_time": qf.time_range.end_utc}
+
+                template_matches = v_idx.search(
+                    query_text=qf.semantic_query or active_query,
+                    filters=qdrant_filters if qdrant_filters else None,
+                    top_k=5,
                 )
 
-            # Append assistant response
+                candidate_rec_ids: List[str] = []
+                if template_matches:
+                    inst_map = v_idx.resolve_search_results_to_instances(conn, template_matches)
+                    for ids in inst_map.values():
+                        candidate_rec_ids.extend(ids)
+
+                # Step 3: Pass 2 Evidentiary Record Execution via DuckDB
+                executor = get_query_executor()
+                matched_records = executor.execute_query(
+                    conn=conn,
+                    query_filter=qf,
+                    candidate_record_ids=candidate_rec_ids if candidate_rec_ids else None,
+                    canonical_table="canonical_logs",
+                    limit=500,
+                )
+
+                # Fallback to direct structured filter if vector candidates yielded no intersection
+                if matched_records.empty and (qf.entity_filters.has_any() or qf.event_id or qf.time_range or qf.level):
+                    matched_records = executor.execute_query(
+                        conn=conn,
+                        query_filter=qf,
+                        candidate_record_ids=None,
+                        canonical_table="canonical_logs",
+                        limit=500,
+                    )
+
+                # Build narrative response
+                match_cnt = len(matched_records)
+                resp_text = f"### 🔍 Forensic Investigation Results\n\n"
+                resp_text += f"**Natural Language Query:** *\"{active_query}\"*\n\n"
+                resp_text += f"**Routing Intent:** `{qf.intent.upper()}` | **Scope:** `{scope_label}`\n\n"
+
+                if qf.intent == "ambiguous" and qf.clarifying_question:
+                    resp_text += f"> 💡 **Clarification Needed:** {qf.clarifying_question}\n\n"
+
+                if match_cnt > 0:
+                    time_cols = [c for c in ["TimeCreated", "time_created_utc"] if c in matched_records.columns]
+                    time_min = matched_records[time_cols[0]].min() if time_cols else "N/A"
+                    time_max = matched_records[time_cols[0]].max() if time_cols else "N/A"
+
+                    host_cols = [c for c in ["Computer", "computer"] if c in matched_records.columns]
+                    hosts = [str(h) for h in matched_records[host_cols[0]].dropna().unique() if str(h).strip()] if host_cols else []
+                    hosts_str = ", ".join(hosts[:3]) + (f" (+{len(hosts)-3} more)" if len(hosts) > 3 else "") if hosts else "N/A"
+
+                    resp_text += f"#### 📊 Evidence Findings\n"
+                    resp_text += f"- **Matched Records:** **{match_cnt:,}** canonical event(s)\n"
+                    resp_text += f"- **Observation Window:** `{time_min}` $\\rightarrow$ `{time_max}`\n"
+                    resp_text += f"- **Target Host(s):** `{hosts_str}`\n"
+                    resp_text += f"- **Templates Matched:** `{len(template_matches)}` clustered pattern(s)\n\n"
+                    resp_text += "Inspect the matched Drain3 templates and exact canonical evidence records below."
+                else:
+                    resp_text += f"❌ **No matching events found** for the parsed filters in `{scope_label}`.\n\n"
+                    resp_text += "Try broadening the search or checking the active log file in the sidebar."
+
             st.session_state["chatbot_messages"].append(
                 {
                     "role": "assistant",
                     "content": resp_text,
-                    "evidence": matched_evidence,
+                    "filter_card": filter_card,
+                    "templates": template_matches,
+                    "evidence": matched_records,
                 }
             )
             st.rerun()
+
+
+# ==============================================================================
+# VIEW 4: DRAIN3 CLUSTERED TEMPLATES & DEDUPLICATION LAYER
+# ==============================================================================
+
+elif st.session_state["active_tab"] == "templates":
+    st.title("🧩 Drain3 Clustered Templates & Evidentiary Traceability")
+    st.markdown(
+        "Inspect the deduplication layer: near-identical log records are automatically clustered "
+        "into structured templates using Drain3, maintaining **100% evidentiary traceability** "
+        "back to every original record in DuckDB."
+    )
+
+    conn = get_duckdb_conn()
+
+    # Check if tables exist
+    tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
+    if "log_templates" not in tables or "canonical_logs" not in tables:
+        st.warning("⚠️ No templates currently mined. Please load or convert logs first.")
+        if st.button("🔄 Go to EVTX Converter", type="primary", **stretch_kw()):
+            st.session_state["active_tab"] = "converter"
+            st.rerun()
+    else:
+        # Load templates and instance stats
+        total_recs = conn.execute("SELECT COUNT(*) FROM canonical_logs").fetchone()[0]
+        total_tpls = conn.execute("SELECT COUNT(*) FROM log_templates").fetchone()[0]
+        total_inst = conn.execute("SELECT COUNT(*) FROM template_instances").fetchone()[0]
+
+        v_idx = get_vector_index(get_embedder())
+        total_vecs = v_idx.client.count(v_idx.collection_name).count
+
+        compression_pct = max(0.0, (1.0 - (total_tpls / total_recs)) * 100.0) if total_recs > 0 else 0.0
+
+        # KPI Metrics
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            st.metric("Total Raw Records", f"{total_recs:,}")
+        with k2:
+            st.metric("Unique Templates", f"{total_tpls:,}")
+        with k3:
+            st.metric("Deduplication Ratio", f"{compression_pct:.1f}%", help="Percentage reduction in search space achieved by Drain3 clustering.")
+        with k4:
+            st.metric("Indexed Vectors", f"{total_vecs:,}", help="1 vector per template stored in Qdrant with cosine similarity.")
+
+        st.markdown("---")
+
+        # Controls & Search
+        c_search, c_btn = st.columns([3, 1])
+        with c_search:
+            search_kw = st.text_input("Filter Templates by Keyword or Event ID:", placeholder="e.g. 4625, logon, USB...")
+        with c_btn:
+            st.write("")
+            st.write("")
+            if st.button("🔄 Re-Mine Templates", **stretch_kw()):
+                with st.spinner("Re-mining templates with Drain3..."):
+                    mgr = get_drain3_mgr()
+                    mgr.process_canonical_records(conn, canonical_table="canonical_logs")
+                    v_idx.index_from_duckdb(conn, templates_table="log_templates")
+                    st.success("Drain3 templates and Qdrant vectors refreshed!")
+                    st.rerun()
+
+        # Fetch templates
+        query_sql = "SELECT template_id, source_type, provider, event_id, level, total_count, first_seen_utc, last_seen_utc, template_string FROM log_templates"
+        params = []
+        if search_kw.strip():
+            query_sql += " WHERE LOWER(template_string) LIKE ? OR event_id LIKE ?"
+            kw_param = f"%{search_kw.strip().lower()}%"
+            params = [kw_param, f"%{search_kw.strip()}%"]
+
+        query_sql += " ORDER BY total_count DESC"
+        tpl_df = conn.execute(query_sql, params).df()
+
+        st.subheader(f"📋 Mined Log Templates ({len(tpl_df):,} templates)")
+        st.dataframe(tpl_df, **stretch_kw())
+
+        st.markdown("---")
+
+        # Traceability Drilldown Section
+        st.subheader("🔗 100% Evidentiary Traceability Inspector")
+        st.markdown("Select any template below to inspect every exact `event_record_id` and raw canonical record it represents.")
+
+        all_tpl_ids = conn.execute("SELECT template_id FROM log_templates ORDER BY total_count DESC").df()["template_id"].tolist()
+        if all_tpl_ids:
+            sel_template_id = st.selectbox("Select Template to Trace:", options=all_tpl_ids)
+
+            if sel_template_id:
+                # Trace instances
+                inst_query = """
+                    SELECT i.event_record_id, i.time_created_utc, i.extracted_variables
+                    FROM template_instances i
+                    WHERE i.template_id = ?
+                    ORDER BY i.time_created_utc ASC
+                """
+                inst_df = conn.execute(inst_query, [sel_template_id]).df()
+
+                # Get canonical records
+                table_cols = [r[0] for r in conn.execute("DESCRIBE canonical_logs").fetchall()]
+                rec_col = "RecordID" if "RecordID" in table_cols else ("event_record_id" if "event_record_id" in table_cols else table_cols[0])
+
+                can_query = f"""
+                    SELECT c.*
+                    FROM canonical_logs c
+                    INNER JOIN template_instances i
+                        ON CAST(c.{rec_col} AS VARCHAR) = i.event_record_id
+                    WHERE i.template_id = ?
+                    ORDER BY i.time_created_utc ASC
+                """
+                full_records_df = conn.execute(can_query, [sel_template_id]).df()
+
+                t_col1, t_col2 = st.columns(2)
+                with t_col1:
+                    st.metric("Total Represented Instances", f"{len(inst_df):,} records")
+                with t_col2:
+                    st.metric("Evidentiary Integrity", "100% (Zero Sampling)")
+
+                with st.expander(f"📜 Individual Record IDs for `{sel_template_id}` ({len(inst_df):,} instances)", expanded=False):
+                    st.dataframe(inst_df, **stretch_kw())
+
+                with st.expander(f"📁 Full Canonical Records for `{sel_template_id}`", expanded=True):
+                    preview_c = [c for c in ["RecordID", "TimeCreated", "LevelName", "EventID", "Channel", "Computer", "UserID", "Message"] if c in full_records_df.columns]
+                    st.dataframe(full_records_df[preview_c if preview_c else full_records_df.columns[:8]], **stretch_kw())
+
+                    csv_data = full_records_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        label="📥 Download Template Records as CSV",
+                        data=csv_data,
+                        file_name=f"{sel_template_id}_instances.csv",
+                        mime="text/csv",
+                        key=f"btn_dl_tpl_{sel_template_id}",
+                    )
+

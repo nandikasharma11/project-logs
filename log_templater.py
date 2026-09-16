@@ -226,7 +226,9 @@ class Drain3ChannelManager:
         """Retrieves or loads the persistent TemplateMiner for a specific source_type."""
         normalized_channel = (source_type or "unknown").strip().capitalize()
         if normalized_channel not in self.miners:
-            persistence_file = self.state_dir / f"{normalized_channel.lower()}_miner.bin"
+            safe_filename = re.sub(r"[^A-Za-z0-9_-]", "_", normalized_channel.lower())
+            persistence_file = self.state_dir / f"{safe_filename}_miner.bin"
+            self.state_dir.mkdir(parents=True, exist_ok=True)
             persistence = FilePersistence(str(persistence_file))
             config = self._get_config()
             miner = TemplateMiner(persistence_handler=persistence, config=config)

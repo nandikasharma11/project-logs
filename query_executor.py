@@ -167,7 +167,7 @@ class EventQueryExecutor:
             "source_type": find_col(["source_type", "channel", "source", "logname"]),
             "provider": find_col(["provider", "providername"]),
             "event_id": find_col(["event_id", "eventid", "id"]),
-            "level": find_col(["level", "levelname", "severity"]),
+            "level": find_col(["levelname", "level", "severity"]),
             "time_created_utc": find_col(["time_created_utc", "timecreated", "timestamp", "systemtime"]),
             "process_id": find_col(["process_id", "processid", "pid"]),
             "thread_id": find_col(["thread_id", "threadid", "tid"]),
@@ -223,10 +223,20 @@ class EventQueryExecutor:
             where_clauses.append(f"CAST({evid_col} AS VARCHAR) = ?")
             params.append(str(query_filter.event_id))
 
-        # 4. Severity Level Filter: level = ?
+        # 4. Severity Level Filter: supports numeric codes and text labels
         if query_filter.level:
-            where_clauses.append(f"LOWER({lvl_col}) = LOWER(?)")
-            params.append(query_filter.level)
+            lvl_clean = str(query_filter.level).strip().lower()
+            lvl_map = {
+                "critical": ["1", "critical"],
+                "error": ["2", "error", "failure", "audit failure"],
+                "warning": ["3", "warning"],
+                "information": ["4", "0", "information", "informational", "info", "audit success"],
+                "verbose": ["5", "verbose"],
+            }
+            allowed = lvl_map.get(lvl_clean, [lvl_clean])
+            placeholders = ", ".join(["?"] * len(allowed))
+            where_clauses.append(f"LOWER(CAST({lvl_col} AS VARCHAR)) IN ({placeholders})")
+            params.extend(allowed)
 
         # 5. Entity Filters:
         entities = query_filter.entity_filters
@@ -338,6 +348,8 @@ class EventQueryExecutor:
 
         logger.debug("Executing SQL: %s with params %s", sql, params)
         return conn.execute(sql, params).df()
+
+    execute_filter = execute_query
 
 
 # ==============================================================================

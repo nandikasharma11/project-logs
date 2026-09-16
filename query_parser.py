@@ -620,6 +620,8 @@ class ForensicQueryParser:
             clarifying_question=clarifying_q,
         )
 
+    parse = parse_query
+
 
 # ==============================================================================
 # 5. MODULE CONVENIENCE FUNCTION
