@@ -76,6 +76,9 @@ class EntityFilters:
     computer: Optional[str] = None
     ip_address: Optional[str] = None
     event_record_id: Optional[str] = None
+    process_name: Optional[str] = None
+    provider: Optional[str] = None
+    status_code: Optional[str] = None
 
     def has_any(self) -> bool:
         return any(v is not None for v in asdict(self).values())
@@ -155,7 +158,14 @@ class TimeExpressionResolver:
         Returns:
             Tuple of (TimeRange or None, residual_text_with_time_removed)
         """
-        ref = reference_time or datetime.datetime.now(datetime.timezone.utc)
+        ref = reference_time
+        if ref is None and data_bounds and len(data_bounds) > 1 and data_bounds[1]:
+            try:
+                ref = date_parser.parse(str(data_bounds[1]))
+            except Exception:
+                ref = None
+        if ref is None:
+            ref = datetime.datetime.now(datetime.timezone.utc)
         if ref.tzinfo is None:
             ref = ref.replace(tzinfo=datetime.timezone.utc)
 
@@ -327,7 +337,7 @@ class TimeExpressionResolver:
 
 
 class ForensicEntityExtractor:
-    """Extracts granular technical entities (process ID, user, IP, logon ID, host)."""
+    """Extracts granular technical entities (process ID, user, IP, logon ID, host, process name, provider, status code)."""
 
     @staticmethod
     def extract(text: str) -> Tuple[EntityFilters, str]:
@@ -339,59 +349,99 @@ class ForensicEntityExtractor:
         comp: Optional[str] = None
         ip: Optional[str] = None
         rec_id: Optional[str] = None
+        proc_name: Optional[str] = None
+        prov: Optional[str] = None
+        status_code: Optional[str] = None
 
-        # 1. Process ID: "process 1064", "process id 1064", "pid 1064", "pid:1064"
-        pid_match = re.search(r"\b(?:process|proc)(?:\s*(?:id|#))?\s*[:=]?\s*(\d+)\b", clean_text, re.I)
+        # 1. Process ID: "process 1064", "process id 1064", "pid 1064", "pid:1064", "process 0x428"
+        pid_match = re.search(r"\b(?:process|proc|pid)(?:\s*(?:id|#))?\s*[:=]?\s*(0x[0-9a-fA-F]+|\d+)\b", clean_text, re.I)
         if pid_match:
             pid = pid_match.group(1)
             clean_text = clean_text.replace(pid_match.group(0), " ")
-        elif re.search(r"\bpid\s*[:=]?\s*(\d+)\b", clean_text, re.I):
-            pm = re.search(r"\bpid\s*[:=]?\s*(\d+)\b", clean_text, re.I)
-            if pm:
-                pid = pm.group(1)
-                clean_text = clean_text.replace(pm.group(0), " ")
 
-        # 2. Thread ID: "thread 4412", "thread id 4412", "tid 4412"
+        # 2. Process Name: e.g. "process powershell.exe", "image lsass.exe", "process svchost.exe"
+        pname_match = re.search(
+            r"\b(?:process(?:\s*name)?|image(?:\s*name)?|executable|app(?:lication)?)\s*(?:is|was|called|named|[:=])?\s*([A-Za-z0-9_.\-]+\.(?:exe|dll|sys|bin|scr))\b",
+            clean_text,
+            re.I,
+        )
+        if pname_match:
+            proc_name = pname_match.group(1)
+            clean_text = clean_text.replace(pname_match.group(0), " ")
+        else:
+            # Standalone .exe mention: "for powershell.exe", "running cmd.exe"
+            exe_match = re.search(r"\b([A-Za-z0-9_.\-]+\.exe)\b", clean_text, re.I)
+            if exe_match:
+                cand_exe = exe_match.group(1)
+                proc_name = cand_exe
+                clean_text = clean_text.replace(cand_exe, " ")
+
+        # 3. Thread ID: "thread 4412", "thread id 4412", "tid 4412"
         tid_match = re.search(r"\b(?:thread|tid)(?:\s*(?:id|#))?\s*[:=]?\s*(\d+)\b", clean_text, re.I)
         if tid_match:
             tid = tid_match.group(1)
             clean_text = clean_text.replace(tid_match.group(0), " ")
 
-        # 3. IP Address (IPv4): e.g. 192.168.1.50
+        # 4. IP Address (IPv4): e.g. 192.168.1.50
         ip_match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", clean_text)
         if ip_match:
             ip = ip_match.group(0)
             clean_text = clean_text.replace(ip, " ")
 
-        # 4. Logon ID: "logon id 0x12a4b", "logon id 999"
+        # 5. Status / Error Code: "status 0xC000006D", "error code 0x80070005"
+        status_match = re.search(r"\b(?:status(?:\s*code)?|error\s*code|substatus)\s*[:=]?\s*(0x[0-9a-fA-F]+)\b", clean_text, re.I)
+        if status_match:
+            status_code = status_match.group(1)
+            clean_text = clean_text.replace(status_match.group(0), " ")
+
+        # 6. Logon ID: "logon id 0x12a4b", "logon id 999"
         lid_match = re.search(r"\blogon\s*(?:id|#)?\s*[:=]?\s*(0x[0-9a-fA-F]+|\d+)\b", clean_text, re.I)
         if lid_match:
             lid = lid_match.group(1)
             clean_text = clean_text.replace(lid_match.group(0), " ")
 
-        # 5. User ID / SID / Username: "user admin", "user_id S-1-5-21-...", "for user jsmith"
+        # 7. User ID / SID / Username:
         sid_match = re.search(r"\b(S-1-[0-59]-\d+(?:-\d+)+)\b", clean_text)
         if sid_match:
             uid = sid_match.group(1)
             clean_text = clean_text.replace(uid, " ")
         else:
-            u_match = re.search(r"\b(?:user(?:name)?|account)\s*[:=]?\s*([A-Za-z0-9_.\-]+)\b", clean_text, re.I)
+            # Matches "user is SYSTEM", "user Administrator", "username: jsmith", "user NT AUTHORITY\SYSTEM"
+            user_stopwords_pat = r'(?:is|was|called|named|for|the|a|an|logon|login|failure|success|event|events|error|name|account|id|user|users|status|who|which|where|with|from|at|in)'
+            u_match = re.search(
+                r'\b(?:user(?:name)?|account)(?:\s*name)?(?:\s+(?:is|was|called|named|for|where|with|from|[:=]))*\s*[:=]?\s*(?!' + user_stopwords_pat + r'\b)([A-Za-z0-9_.\-\\\\]+)\b',
+                clean_text,
+                re.I,
+            )
             if u_match:
-                cand = u_match.group(1)
-                # Filter out generic terms that aren't usernames
-                if cand.lower() not in ("logon", "login", "failure", "success", "event", "error", "name", "account"):
-                    uid = cand
-                    clean_text = clean_text.replace(u_match.group(0), " ")
+                uid = u_match.group(1)
+                clean_text = clean_text.replace(u_match.group(0), " ")
 
-        # 6. Computer / Hostname: "on host SEC-SRV-01", "machine DB-SERVER"
-        comp_match = re.search(r"\b(?:computer|machine|host)\s*[:=]?\s*([A-Za-z0-9\-]+)\b", clean_text, re.I)
+        # 8. Computer / Hostname:
+        comp_stopwords_pat = r'(?:is|was|called|named|on|where|with|from|in|at|the|a|an|name|local|remote|server|machine|computer|host|workstation|id|log|which)'
+        comp_match = re.search(
+            r'\b(?:computer|machine|host|workstation)(?:\s*name)?(?:\s+(?:is|was|called|named|on|where|in|from|[:=]))*\s*[:=]?\s*(?!' + comp_stopwords_pat + r'\b)([A-Za-z0-9_.\-]+)\b',
+            clean_text,
+            re.I,
+        )
         if comp_match:
-            cand = comp_match.group(1)
-            if cand.lower() not in ("name", "this", "local", "that"):
-                comp = cand
-                clean_text = clean_text.replace(comp_match.group(0), " ")
+            comp = comp_match.group(1)
+            clean_text = clean_text.replace(comp_match.group(0), " ")
 
-        # 7. Event Record ID: "event record id 4120", "record REC_00120"
+        # 9. Provider: "provider Service Control Manager", "from provider X"
+        prov_match = re.search(
+            r"\b(?:provider|source)\s*(?:is|was|called|named|[:=])?\s*([A-Za-z0-9\-_. ]+?)(?=(?:\s+(?:log|events?|in|on|with|for)\b|$))",
+            clean_text,
+            re.I,
+        )
+        if prov_match:
+            cand_prov = prov_match.group(1).strip()
+            prov_stopwords = {"is", "was", "called", "named", "the", "a", "an", "name", "log", "events", "from", "where"}
+            if cand_prov.lower() not in prov_stopwords and len(cand_prov) > 2:
+                prov = cand_prov
+                clean_text = clean_text.replace(prov_match.group(0), " ")
+
+        # 10. Event Record ID: "event record id 4120", "record REC_00120"
         rec_match = re.search(r"\b(?:event\s*record\s*id|record\s*id|record)\s*[:=]?\s*(REC_\d+|\d+)\b", clean_text, re.I)
         if rec_match:
             rec_id = rec_match.group(1)
@@ -405,6 +455,9 @@ class ForensicEntityExtractor:
             computer=comp,
             ip_address=ip,
             event_record_id=rec_id,
+            process_name=proc_name,
+            provider=prov,
+            status_code=status_code,
         )
         return entities, clean_text
 
@@ -445,14 +498,35 @@ class EventIdResolver:
 
 
 class SeverityLevelResolver:
-    """Resolves event severity/level from query mentions."""
+    """Resolves event severity/level from query mentions with audit-awareness."""
 
     @staticmethod
-    def resolve(text: str) -> Optional[str]:
+    def resolve(
+        text: str,
+        source_type: Optional[str] = None,
+        event_id: Optional[str] = None,
+    ) -> Optional[str]:
         if re.search(r"\b(?:critical|fatal)\b", text, re.I):
             return "Critical"
-        if re.search(r"\b(?:error|failed|failure|fault|crash)\b", text, re.I):
+
+        # Explicit level request: "level error", "severity error", "error level"
+        explicit_error = bool(re.search(r"\b(?:severity\s+error|level\s+error|error\s+level)\b", text, re.I))
+
+        # Check if query is a Security audit event where LevelName is LogAlways
+        is_security_audit = (
+            (source_type and str(source_type).lower() == "security") or
+            (event_id and str(event_id) in ("4624", "4625", "4634", "4648", "4672", "4688", "4689", "4720", "4740", "4724", "1102"))
+        )
+
+        if re.search(r"\b(?:error|errors|fault|crash)\b", text, re.I):
             return "Error"
+
+        if re.search(r"\b(?:failed|failure)\b", text, re.I):
+            # If it's a Security audit event (e.g. logon failure) without explicit level error requested, don't force Error level
+            if is_security_audit and not explicit_error:
+                return None
+            return "Error"
+
         if re.search(r"\b(?:warning|warn)\b", text, re.I):
             return "Warning"
         if re.search(r"\b(?:info|information|informational)\b", text, re.I):
@@ -563,7 +637,7 @@ class ForensicQueryParser:
         raw_query = (query or "").strip()
         working_text = raw_query
 
-        # 1. Resolve Time Expression
+        # 1. Resolve Time Expression (anchors to data_bounds if reference_time omitted)
         time_range, working_text = self.time_resolver.resolve(
             working_text,
             reference_time=reference_time,
@@ -579,8 +653,8 @@ class ForensicQueryParser:
         # 4. Classify Source Channel (Strict zero-false-narrowing)
         source_type = self.channel_classifier.classify(raw_query) or channel_hint
 
-        # 5. Resolve Severity Level
-        level = self.severity_resolver.resolve(raw_query)
+        # 5. Resolve Severity Level (aware of audit events)
+        level = self.severity_resolver.resolve(raw_query, source_type=source_type, event_id=event_id)
 
         # 6. Classify Intent
         intent, clarifying_q = self.classify_intent(
@@ -596,6 +670,8 @@ class ForensicQueryParser:
             r"\b(?:show\s+me|find|get|display|list|tell\s+me|check)\b",
             r"\b(?:please|the|a|an|for|of|on|in|around|about|at|did|ever|how|often|many|times)\b",
             r"\b(?:event|events|log|logs|record|records)\b",
+            r"\b(?:what|occurred|happened|occurrences?)\b",
+            r"\b(?:where|which|who|with|level|severity|source|channel)\b",
         ]
         semantic_text = working_text
         for f in fillers:
@@ -604,7 +680,7 @@ class ForensicQueryParser:
         # Clean multiple spaces and punctuation
         semantic_query = " ".join(re.sub(r"[^\w\s\-\.]", " ", semantic_text).split()).strip()
 
-        # If semantic query became empty, fallback to non-stopword query tokens
+        # If semantic query became empty, fallback to non-stopword query tokens or raw_query
         if not semantic_query:
             semantic_query = raw_query
 

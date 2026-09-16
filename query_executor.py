@@ -55,9 +55,9 @@ EVENT_DATA_KEY_MAPPINGS: Dict[str, Union[List[str], Dict[str, List[str]]]] = {
         "default": ["TargetLogonId", "SubjectLogonId", "LogonId"],
     },
     "user_id": {
-        "4624": ["TargetUserName", "SubjectUserName"],
-        "4625": ["TargetUserName", "SubjectUserName"],
-        "default": ["TargetUserName", "SubjectUserName", "UserName", "AccountName", "TargetUser"],
+        "4624": ["TargetUserName", "SubjectUserName", "TargetUserSid", "SubjectUserSid"],
+        "4625": ["TargetUserName", "SubjectUserName", "TargetUserSid", "SubjectUserSid"],
+        "default": ["TargetUserName", "SubjectUserName", "UserName", "AccountName", "TargetUser", "SubjectUserSid", "TargetUserSid", "UserSid"],
     },
     "user_name": {
         "4624": ["TargetUserName", "SubjectUserName"],
@@ -241,16 +241,50 @@ class EventQueryExecutor:
         # 5. Entity Filters:
         entities = query_filter.entity_filters
 
-        # Process ID
+        # Process ID (support both decimal and hex matching across top-level and EventData)
         if entities.process_id:
-            val = str(entities.process_id).strip()
+            val_raw = str(entities.process_id).strip()
+            val_dec = str(int(val_raw, 16)) if val_raw.lower().startswith("0x") else val_raw
+            try:
+                val_hex = hex(int(val_dec))
+            except Exception:
+                val_hex = val_raw
+
+            clause_dec, p_dec = query_event_data("process_id", val_dec, query_filter.event_id, json_col=ed_col)
+            clause_hex, p_hex = query_event_data("process_id", val_hex, query_filter.event_id, json_col=ed_col)
+            
             if pid_col:
-                where_clauses.append(f"CAST({pid_col} AS VARCHAR) = ?")
-                params.append(val)
+                pid_clause = f"(CAST({pid_col} AS VARCHAR) = ? OR {clause_dec} OR {clause_hex})"
+                where_clauses.append(pid_clause)
+                params.append(val_dec)
+                params.extend(p_dec)
+                params.extend(p_hex)
             else:
-                clause, p = query_event_data("process_id", val, query_filter.event_id, json_col=ed_col)
-                where_clauses.append(clause)
-                params.extend(p)
+                where_clauses.append(f"({clause_dec} OR {clause_hex})")
+                params.extend(p_dec)
+                params.extend(p_hex)
+
+        # Process Name / Image (matches exact key and path substring)
+        if getattr(entities, "process_name", None) and entities.process_name:
+            pname = str(entities.process_name).strip()
+            clause_pname, p_pname = query_event_data("process_name", pname, query_filter.event_id, json_col=ed_col)
+            like_clause = f"(LOWER(json_extract_string(TRY_CAST({ed_col} AS JSON), '$.NewProcessName')) LIKE ? OR LOWER(json_extract_string(TRY_CAST({ed_col} AS JSON), '$.ProcessName')) LIKE ?)"
+            where_clauses.append(f"({clause_pname} OR {like_clause})")
+            params.extend(p_pname)
+            params.extend([f"%{pname.lower()}%", f"%{pname.lower()}%"])
+
+        # Provider
+        if getattr(entities, "provider", None) and entities.provider:
+            prov_val = str(entities.provider).strip()
+            where_clauses.append(f"LOWER({prov_col}) LIKE ?")
+            params.append(f"%{prov_val.lower()}%")
+
+        # Status Code (e.g. 0xC000006D)
+        if getattr(entities, "status_code", None) and entities.status_code:
+            code_val = str(entities.status_code).strip()
+            clause_code, p_code = query_event_data("status_code", code_val, query_filter.event_id, json_col=ed_col)
+            where_clauses.append(clause_code)
+            params.extend(p_code)
 
         # Thread ID
         if entities.thread_id:
@@ -266,17 +300,35 @@ class EventQueryExecutor:
                 where_clauses.append(f"LOWER({comp_col}) = LOWER(?)")
                 params.append(val)
 
-        # User ID / Username (check top-level column AND/OR event_data JSON)
+        # User ID / Username (check top-level column AND/OR event_data JSON with SID mapping)
         if entities.user_id:
             val = str(entities.user_id).strip()
-            json_clause, json_params = query_event_data("user_id", val, query_filter.event_id, json_col=ed_col)
-            if uid_col:
-                where_clauses.append(f"(LOWER({uid_col}) = LOWER(?) OR {json_clause})")
-                params.append(val)
-                params.extend(json_params)
+            sid_equivalents = {
+                "system": ["s-1-5-18", "system"],
+                "local system": ["s-1-5-18", "system", "local system"],
+                "local service": ["s-1-5-19", "local service"],
+                "network service": ["s-1-5-20", "network service"],
+                "s-1-5-18": ["s-1-5-18", "system"],
+                "s-1-5-19": ["s-1-5-19", "local service"],
+                "s-1-5-20": ["s-1-5-20", "network service"],
+            }
+            cand_users = sid_equivalents.get(val.lower(), [val])
+
+            user_subclauses = []
+            for u in cand_users:
+                json_clause, json_params = query_event_data("user_id", u, query_filter.event_id, json_col=ed_col)
+                if uid_col:
+                    user_subclauses.append(f"(LOWER({uid_col}) = LOWER(?) OR {json_clause})")
+                    params.append(u)
+                    params.extend(json_params)
+                else:
+                    user_subclauses.append(json_clause)
+                    params.extend(json_params)
+
+            if len(user_subclauses) == 1:
+                where_clauses.append(user_subclauses[0])
             else:
-                where_clauses.append(json_clause)
-                params.extend(json_params)
+                where_clauses.append(f"({' OR '.join(user_subclauses)})")
 
         # IP Address (located inside event_data JSON)
         if entities.ip_address:

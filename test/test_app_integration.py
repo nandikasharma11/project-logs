@@ -169,3 +169,67 @@ def test_app_sync_duplicate_record_ids_across_channels():
     assert integrity["canonical_count"] == 3
     assert integrity["instance_count"] == 3
 
+
+def test_generate_chatgpt_forensic_response():
+    """Validates that generate_chatgpt_forensic_response produces a ChatGPT-style response
+    centered on the user query, with direct answer, centered statistics card, and diagnostic guidance.
+    """
+    parser = app.get_query_parser()
+    qf = parser.parse("Show logon failures for user Admin")
+
+    sample_records = pd.DataFrame([
+        {
+            "RecordID": "101",
+            "TimeCreated": "2026-09-15 14:00:00",
+            "EventID": "4625",
+            "LevelName": "LogAlways",
+            "Channel": "Security",
+            "Provider": "Microsoft-Windows-Security-Auditing",
+            "Computer": "SEC-SRV01",
+            "ProcessID": "672",
+            "UserID": "Admin",
+            "Message": "An account failed to log on.",
+            "EventData": '{"TargetUserName": "Admin", "IpAddress": "10.0.0.1", "Status": "0xC000006D"}',
+        }
+    ])
+
+    sample_templates = [
+        {
+            "template_id": "tpl_001",
+            "template_string": "An account failed to log on. Subject: <*>",
+            "occurrence_count": 1,
+        }
+    ]
+
+    # 1. Matched response test
+    resp_matched = app.generate_chatgpt_forensic_response(
+        query="Show logon failures for user Admin",
+        qf=qf,
+        records=sample_records,
+        templates=sample_templates,
+        scope_label="Security.csv",
+        total_scope_records=100,
+    )
+
+    assert "### 🔍 Forensic Findings" in resp_matched
+    assert "Forensic analysis for user **`Admin`**" in resp_matched
+    assert "Forensic Evidence Statistics" in resp_matched
+    assert "Matched Records" in resp_matched
+    assert "Technical Details & Payload Highlights" in resp_matched
+    assert "10.0.0.1" in resp_matched or "0xC000006D" in resp_matched
+
+    # 2. Zero-match response test
+    resp_zero = app.generate_chatgpt_forensic_response(
+        query="Show logon failures for user Admin",
+        qf=qf,
+        records=pd.DataFrame(),
+        templates=[],
+        scope_label="System.csv",
+        total_scope_records=50,
+    )
+
+    assert "No matching events found" in resp_zero
+    assert "Query Resolution Diagnostic" in resp_zero
+    assert "Why Did This Query Return No Results?" in resp_zero
+    assert "Channel Mismatch" in resp_zero
+

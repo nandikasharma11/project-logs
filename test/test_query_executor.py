@@ -366,6 +366,80 @@ class TestQueryExecutor(unittest.TestCase):
         self.assertIn("192.168.1.50", row["event_data"])
         self.assertIn("<EventID>4625</EventID>", row["raw_xml"])
 
+    def test_07_sid_and_user_resolution(self):
+        """Verify that querying for well-known account 'SYSTEM' resolves to S-1-5-18,
+        matching rows stored with SID user_id.
+        """
+        q_filter = QueryFilter(
+            time_range=None,
+            source_type=None,
+            entity_filters=EntityFilters(user_id="SYSTEM"),
+            event_id=None,
+            level=None,
+            semantic_query="",
+            intent="specific_instance",
+            raw_query="events where user is SYSTEM",
+        )
+
+        results = self.executor.execute_query(self.conn, q_filter, canonical_table="canonical_logs")
+        rec_ids = list(results["event_record_id"])
+        # REC_00004 and REC_00005 both have user_id = S-1-5-18
+        self.assertIn("REC_00004", rec_ids)
+        self.assertIn("REC_00005", rec_ids)
+
+    def test_08_hex_and_dec_process_id(self):
+        """Verify that querying for hex process ID 0x428 matches decimal 1064 in DuckDB."""
+        q_filter = QueryFilter(
+            time_range=None,
+            source_type=None,
+            entity_filters=EntityFilters(process_id="0x428"),
+            event_id=None,
+            level=None,
+            semantic_query="",
+            intent="specific_instance",
+            raw_query="events for process 0x428",
+        )
+
+        results = self.executor.execute_query(self.conn, q_filter, canonical_table="canonical_logs")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results.iloc[0]["event_record_id"], "REC_00004")
+        self.assertEqual(str(results.iloc[0]["process_id"]), "1064")
+
+    def test_09_process_name_and_provider_and_status_code(self):
+        """Verify querying by process_name, provider, and status_code."""
+        # 1. Provider
+        q_prov = QueryFilter(
+            time_range=None,
+            source_type=None,
+            entity_filters=EntityFilters(provider="Service Control Manager"),
+            event_id=None,
+            level=None,
+            semantic_query="",
+            intent="specific_instance",
+            raw_query="provider Service Control Manager",
+        )
+        res_prov = self.executor.execute_query(self.conn, q_prov, canonical_table="canonical_logs")
+        self.assertEqual(len(res_prov), 1)
+        self.assertEqual(res_prov.iloc[0]["event_record_id"], "REC_00004")
+
+        # 2. Status code inside event_data
+        q_status = QueryFilter(
+            time_range=None,
+            source_type=None,
+            entity_filters=EntityFilters(status_code="0xC000006D"),
+            event_id=None,
+            level=None,
+            semantic_query="",
+            intent="specific_instance",
+            raw_query="logon failure status 0xC000006D",
+        )
+        res_status = self.executor.execute_query(self.conn, q_status, canonical_table="canonical_logs")
+        # REC_00001 and REC_00003 have Status 0xC000006D in event_data
+        self.assertEqual(len(res_status), 2)
+        rec_ids = list(res_status["event_record_id"])
+        self.assertIn("REC_00001", rec_ids)
+        self.assertIn("REC_00003", rec_ids)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

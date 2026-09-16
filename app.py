@@ -364,30 +364,50 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+    /* ========================================================================= */
+    /* STANDARD BLUE FORENSIC THEME & HIGH-CONTRAST TYPOGRAPHY                  */
+    /* ========================================================================= */
+
+    /* Typography & Contrast */
+    html, body, [class*="css"] {
+        color: #1E293B;
+    }
+    h1, h2, h3, h4, h5, h6 {
+        color: #0F172A !important;
+        font-weight: 700 !important;
+        letter-spacing: -0.01em !important;
+    }
+    p, span, label, div {
+        color: #1E293B;
+    }
+
     /* Metric Card Styling */
     div[data-testid="metric-container"] {
         background-color: #FFFFFF;
-        border: 1px solid #E2E8F0;
+        border: 1px solid #CBD5E1;
+        border-top: 3px solid #1E88E5;
         padding: 12px 18px;
-        border-radius: 10px;
+        border-radius: 8px;
         box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
         transition: all 0.2s ease-in-out;
     }
     div[data-testid="metric-container"]:hover {
         border-color: #1E88E5;
-        box-shadow: 0 4px 12px rgba(30, 136, 229, 0.12);
+        box-shadow: 0 4px 12px rgba(30, 136, 229, 0.15);
     }
     div[data-testid="metric-container"] label {
-        color: #64748B !important;
-        font-weight: 600 !important;
+        color: #475569 !important;
+        font-weight: 700 !important;
         font-size: 0.80rem !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.04em !important;
     }
     div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
         color: #0F172A !important;
         font-weight: 800 !important;
     }
 
-    /* Primary Buttons -> Blue */
+    /* Primary Buttons -> Standard Blue */
     button[kind="primary"],
     div[data-testid="stButton"] > button[kind="primary"],
     .stButton > button[type="primary"],
@@ -397,7 +417,7 @@ st.markdown(
         color: #FFFFFF !important;
         box-shadow: 0 2px 8px rgba(30, 136, 229, 0.25) !important;
         border-radius: 6px !important;
-        font-weight: 600 !important;
+        font-weight: 700 !important;
     }
     button[kind="primary"]:hover,
     div[data-testid="stButton"] > button[kind="primary"]:hover,
@@ -405,66 +425,81 @@ st.markdown(
         background-color: #1976D2 !important;
         border-color: #1565C0 !important;
         color: #FFFFFF !important;
-        box-shadow: 0 4px 12px rgba(30, 136, 229, 0.35) !important;
+        box-shadow: 0 4px 14px rgba(30, 136, 229, 0.35) !important;
     }
 
     /* Secondary / Action Buttons */
     .stButton > button {
         border-radius: 6px !important;
         font-size: 0.85rem !important;
-        border-color: #CBD5E1 !important;
+        border: 1px solid #CBD5E1 !important;
         color: #1E293B !important;
         background-color: #FFFFFF !important;
+        font-weight: 600 !important;
         transition: all 0.15s ease-in-out;
     }
     .stButton > button:hover {
         border-color: #1E88E5 !important;
         color: #1E88E5 !important;
-        background-color: #F8FAFC !important;
+        background-color: #F0F7FF !important;
     }
 
     /* Download Buttons */
     .stDownloadButton > button {
-        border-color: #1E88E5 !important;
+        border: 1px solid #1E88E5 !important;
         color: #1E88E5 !important;
         background-color: #FFFFFF !important;
         border-radius: 6px !important;
-        font-weight: 600 !important;
+        font-weight: 700 !important;
     }
     .stDownloadButton > button:hover {
-        background-color: rgba(30, 136, 229, 0.08) !important;
+        background-color: #1E88E5 !important;
         border-color: #1565C0 !important;
-        color: #1565C0 !important;
+        color: #FFFFFF !important;
     }
 
     /* Inputs focus */
-    input:focus, textarea:focus, div[data-baseweb="input"]:focus-within {
+    input:focus, textarea:focus, div[data-baseweb="input"]:focus-within, div[data-baseweb="select"]:focus-within {
         border-color: #1E88E5 !important;
         box-shadow: 0 0 0 1px #1E88E5 !important;
     }
 
+    /* Sidebar Navigation Radios */
+    section[data-testid="stSidebar"] {
+        background-color: #F8FAFC !important;
+        border-right: 1px solid #E2E8F0 !important;
+    }
+    section[data-testid="stSidebar"] .stRadio > div[role="radiogroup"] > label {
+        padding: 8px 12px !important;
+        border-radius: 8px !important;
+        transition: all 0.15s ease-in-out !important;
+        margin-bottom: 4px !important;
+        border: 1px solid transparent !important;
+    }
+    section[data-testid="stSidebar"] .stRadio > div[role="radiogroup"] > label:hover {
+        background-color: #EDF5FD !important;
+        border-color: #BAE6FD !important;
+    }
+    section[data-testid="stSidebar"] .stRadio > div[role="radiogroup"] > label:has(input:checked) {
+        background-color: #E0F2FE !important;
+        border-color: #38BDF8 !important;
+        font-weight: 700 !important;
+        color: #0369A1 !important;
+    }
+
     /* ------------------------------------------------------------- */
-    /* FORENSIC GRID ROW ALIGNMENT & FONT CONTRAST                   */
+    /* FORENSIC GRID ROW & HEADER ALIGNMENT                          */
     /* ------------------------------------------------------------- */
 
     /* Ensure every horizontal block is vertically centered */
     div[data-testid="stHorizontalBlock"] {
         align-items: center !important;
         border-bottom: 1px solid #E2E8F0 !important;
-        padding-top: 1px !important;
-        padding-bottom: 1px !important;
+        padding-top: 2px !important;
+        padding-bottom: 2px !important;
     }
 
-    /* Ensure each column has no top margin displacement */
-    div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
-        display: flex !important;
-        align-items: center !important;
-        justify-content: flex-start !important;
-        min-height: 32px !important;
-        padding: 0 4px !important;
-    }
-
-    /* Remove paragraph margins which caused vertical displacement */
+    /* Remove paragraph margins causing vertical displacement */
     div[data-testid="stHorizontalBlock"] div[data-testid="stMarkdownContainer"] p {
         margin: 0 !important;
         padding: 0 !important;
@@ -472,6 +507,24 @@ st.markdown(
         white-space: nowrap !important;
         overflow: hidden !important;
         text-overflow: ellipsis !important;
+    }
+
+    /* Grid Table Header Cells */
+    .th-cell {
+        background-color: #1E3A8A !important;
+        color: #FFFFFF !important;
+        font-size: 0.76rem !important;
+        font-weight: 800 !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.05em !important;
+        padding: 7px 6px !important;
+        border-radius: 4px !important;
+        border-bottom: 2px solid #1E88E5 !important;
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        line-height: 1.2 !important;
+        display: block !important;
     }
 
     /* Action button column: exact centering and compact 26px height */
@@ -491,13 +544,13 @@ st.markdown(
         line-height: 24px !important;
         padding: 0 6px !important;
         font-size: 0.76rem !important;
-        font-weight: 600 !important;
+        font-weight: 700 !important;
         margin: 0 !important;
         border-radius: 4px !important;
         width: 100% !important;
     }
 
-    /* HIGH-CONTRAST CELL TYPOGRAPHY ON LIGHT BACKGROUND */
+    /* HIGH-CONTRAST CELL TYPOGRAPHY */
     .cell-mono {
         font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace !important;
         font-size: 0.82rem !important;
@@ -636,26 +689,35 @@ st.markdown(
         display: inline-block;
     }
 
-    /* Chatbot Message Styling */
+    /* ------------------------------------------------------------- */
+    /* CHATGPT-STYLE AI ASSISTANT CONVERSATIONAL UI                  */
+    /* ------------------------------------------------------------- */
     div[data-testid="stChatMessage"] {
         border-radius: 12px !important;
-        padding: 14px 18px !important;
-        margin-bottom: 12px !important;
-        border: 1px solid rgba(30, 136, 229, 0.12) !important;
+        padding: 16px 20px !important;
+        margin-bottom: 16px !important;
+        border: 1px solid #E2E8F0 !important;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04) !important;
         transition: all 0.2s ease-in-out !important;
     }
     div[data-testid="stChatMessage"]:hover {
-        border-color: rgba(30, 136, 229, 0.3) !important;
+        border-color: rgba(30, 136, 229, 0.35) !important;
     }
     div[data-testid="stChatMessage"][data-testid*="user"] {
-        background-color: rgba(30, 136, 229, 0.05) !important;
+        background-color: #F0F7FF !important;
+        border: 1px solid #BAE6FD !important;
     }
     div[data-testid="stChatMessage"][data-testid*="assistant"] {
         background-color: #FFFFFF !important;
-        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.03) !important;
+        border-left: 4px solid #1E88E5 !important;
     }
     div[data-testid="stChatInput"] {
         border-radius: 10px !important;
+        border: 1px solid #90CAF9 !important;
+    }
+    div[data-testid="stChatInput"]:focus-within {
+        border-color: #1E88E5 !important;
+        box-shadow: 0 0 0 2px rgba(30, 136, 229, 0.2) !important;
     }
     </style>
     """,
@@ -770,11 +832,13 @@ def sync_dataframe_to_duckdb(
 
     tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
     table_exists = "canonical_logs" in tables
+    templates_exist = "log_templates" in tables and "template_instances" in tables
 
-    needs_full_reload = not table_exists or force_resync
+    needs_full_reload = not table_exists or not templates_exist or force_resync
     if table_exists and not needs_full_reload:
         current_count = conn.execute("SELECT COUNT(*) FROM canonical_logs").fetchone()[0]
-        if current_count != len(df):
+        tpl_count_curr = conn.execute("SELECT COUNT(*) FROM log_templates").fetchone()[0] if "log_templates" in tables else 0
+        if current_count != len(df) or tpl_count_curr == 0:
             needs_full_reload = True
 
     if needs_full_reload:
@@ -795,7 +859,7 @@ def sync_dataframe_to_duckdb(
     v_stats = v_idx.index_from_duckdb(conn, templates_table="log_templates")
 
     rec_count = conn.execute("SELECT COUNT(*) FROM canonical_logs").fetchone()[0]
-    tpl_count = conn.execute("SELECT COUNT(*) FROM log_templates").fetchone()[0]
+    tpl_count = conn.execute("SELECT COUNT(*) FROM log_templates").fetchone()[0] if "log_templates" in [r[0] for r in conn.execute("SHOW TABLES").fetchall()] else 0
     v_count = v_idx.client.count(v_idx.collection_name).count
 
     return {
@@ -805,6 +869,296 @@ def sync_dataframe_to_duckdb(
         "drain_stats": drain_stats,
         "vector_stats": v_stats,
     }
+
+
+# ------------------------------------------------------------------------------
+# WINDOWS EVENT TAXONOMY & CHATGPT-STYLE FORENSIC SYNTHESIZER
+# ------------------------------------------------------------------------------
+
+WINDOWS_EVENT_DESCRIPTIONS: Dict[str, str] = {
+    "4624": "Successful account logon",
+    "4625": "Failed account logon / Authentication failure",
+    "4634": "Account logoff",
+    "4648": "Logon attempted using explicit credentials",
+    "4672": "Special privileges assigned to new logon",
+    "4688": "New process creation",
+    "4689": "Process exit / termination",
+    "4720": "User account created",
+    "4724": "Password reset attempted",
+    "4740": "User account locked out",
+    "1102": "Audit log cleared",
+    "7036": "Service state change (started/stopped)",
+    "7040": "Service start type changed",
+    "7045": "New Windows service installed",
+    "6008": "Unexpected dirty shutdown",
+    "1000": "Application crash / faulting module error",
+    "10016": "DCOM permission error",
+    "7": "Disk bad block / I/O device error",
+    "5": "Disk block warning",
+    "16": "Filesystem data integrity verification warning",
+    "12": "Operating system kernel startup time",
+    "13": "Operating system kernel shutdown",
+    "41": "System rebooted without cleanly shutting down",
+}
+
+
+def generate_chatgpt_forensic_response(
+    query: str,
+    qf: QueryFilter,
+    records: pd.DataFrame,
+    templates: List[Dict[str, Any]],
+    scope_label: str,
+    total_scope_records: int,
+    conn: Optional[duckdb.DuckDBPyConnection] = None,
+) -> str:
+    """Generates an intelligent, ChatGPT-style conversational forensic analysis response
+    centered strictly around the user's query and the statistics behind it.
+    """
+    match_cnt = len(records) if records is not None else 0
+
+    # --------------------------------------------------------------------------
+    # CASE A: ZERO RECORDS MATCHED
+    # --------------------------------------------------------------------------
+    if match_cnt == 0:
+        resp = f"### 🔍 Forensic Analysis: *\"{query}\"*\n\n"
+        resp += f"**Result:** ❌ **No matching events found** in active scope `{scope_label}`.\n\n"
+
+        resp += "#### 🛠️ Query Resolution Diagnostic\n"
+        resp += f"- **Identified Intent:** `{qf.intent.upper()}`\n"
+        if qf.source_type:
+            resp += f"- **Requested Channel:** `{qf.source_type}`\n"
+        if qf.event_id:
+            desc = WINDOWS_EVENT_DESCRIPTIONS.get(str(qf.event_id), "Windows Event")
+            resp += f"- **Target Event ID:** `{qf.event_id}` (*{desc}*)\n"
+        if qf.level:
+            resp += f"- **Severity Level:** `{qf.level}`\n"
+        if qf.time_range:
+            resp += f"- **Time Window:** `{qf.time_range.start_utc}` to `{qf.time_range.end_utc}` (UTC)\n"
+        ent_items = [f"{k}: `{v}`" for k, v in qf.entity_filters.to_dict().items() if v]
+        if ent_items:
+            resp += f"- **Extracted Entities:** {', '.join(ent_items)}\n"
+
+        resp += "\n---\n"
+        resp += "#### 💡 Why Did This Query Return No Results?\n"
+
+        diagnostics = []
+        if qf.source_type and "all" not in scope_label.lower():
+            if qf.source_type.lower() not in scope_label.lower():
+                diagnostics.append(
+                    f"**Channel Mismatch:** Your query targets the **{qf.source_type}** log, but the current investigation scope is locked to **`{scope_label}`**. "
+                    f"Please switch the sidebar dropdown to **All Converted Logs (Consolidated)** or **{qf.source_type}.csv**."
+                )
+
+        if conn is not None and qf.entity_filters.process_id:
+            try:
+                pid_query = qf.entity_filters.process_id
+                pid_exists = conn.execute(
+                    "SELECT COUNT(*) FROM canonical_logs WHERE CAST(ProcessID AS VARCHAR) = ?",
+                    [pid_query],
+                ).fetchone()[0]
+                if pid_exists == 0:
+                    top_pids = [
+                        f"`{r[0]}` ({r[1]:,} events)"
+                        for r in conn.execute(
+                            "SELECT ProcessID, COUNT(*) FROM canonical_logs WHERE ProcessID IS NOT NULL AND ProcessID != '' GROUP BY ProcessID ORDER BY COUNT(*) DESC LIMIT 5"
+                        ).fetchall()
+                    ]
+                    diagnostics.append(
+                        f"**Process ID Not Found:** Process ID `{pid_query}` does not exist in `{scope_label}`. "
+                        f"Top active Process IDs in this scope: {', '.join(top_pids)}."
+                    )
+            except Exception:
+                pass
+
+        if qf.time_range and conn is not None:
+            try:
+                tb = conn.execute("SELECT MIN(TimeCreated), MAX(TimeCreated) FROM canonical_logs").fetchone()
+                if tb and tb[0] and tb[1]:
+                    if qf.time_range.end_utc < str(tb[0]) or qf.time_range.start_utc > str(tb[1]):
+                        diagnostics.append(
+                            f"**Out-of-Bounds Time Window:** The parsed time window (`{qf.time_range.start_utc}` to `{qf.time_range.end_utc}`) "
+                            f"is outside the dataset's available coverage (`{tb[0]}` to `{tb[1]}` UTC)."
+                        )
+            except Exception:
+                pass
+
+        if not diagnostics:
+            diagnostics.append(
+                "No records matched all combined filters simultaneously. Try broadening your query or selecting **All Converted Logs (Consolidated)** in the sidebar."
+            )
+
+        for d in diagnostics:
+            resp += f"- {d}\n"
+
+        return resp
+
+    # --------------------------------------------------------------------------
+    # CASE B: RECORDS FOUND - CHATGPT-STYLE NARRATIVE & CENTERED STATS
+    # --------------------------------------------------------------------------
+    time_cols = [c for c in ["TimeCreated", "time_created_utc"] if c in records.columns]
+    time_min = str(records[time_cols[0]].min()) if time_cols else "N/A"
+    time_max = str(records[time_cols[0]].max()) if time_cols else "N/A"
+
+    duration_str = "N/A"
+    try:
+        dt_min = date_parser.parse(time_min)
+        dt_max = date_parser.parse(time_max)
+        diff_sec = int((dt_max - dt_min).total_seconds())
+        if diff_sec < 60:
+            duration_str = f"{diff_sec} seconds"
+        elif diff_sec < 3600:
+            duration_str = f"{diff_sec // 60}m {diff_sec % 60}s"
+        elif diff_sec < 86400:
+            duration_str = f"{diff_sec // 3600}h {(diff_sec % 3600) // 60}m"
+        else:
+            duration_str = f"{diff_sec // 86400}d {(diff_sec % 86400) // 3600}h"
+    except Exception:
+        pass
+
+    host_cols = [c for c in ["Computer", "computer"] if c in records.columns]
+    hosts = [str(h) for h in records[host_cols[0]].dropna().unique() if str(h).strip()] if host_cols else []
+    hosts_str = ", ".join(hosts[:2]) + (f" (+{len(hosts)-2} more)" if len(hosts) > 2 else "") if hosts else "N/A"
+
+    user_cols = [c for c in ["UserID", "user_id"] if c in records.columns]
+    users_raw = [str(u) for u in records[user_cols[0]].dropna().unique() if str(u).strip() and str(u).lower() not in ("nan", "none", "null")] if user_cols else []
+
+    ed_users = set()
+    ed_procs = set()
+    ed_statuses = set()
+    ed_ips = set()
+    ed_services = set()
+
+    for ed_str in records.get("EventData", []).dropna().head(500):
+        if not ed_str:
+            continue
+        try:
+            parsed_ed = json.loads(ed_str) if isinstance(ed_str, str) else ed_str
+            if isinstance(parsed_ed, dict):
+                for k in ("TargetUserName", "SubjectUserName", "UserName", "AccountName"):
+                    if parsed_ed.get(k) and str(parsed_ed[k]).strip():
+                        ed_users.add(str(parsed_ed[k]).strip())
+                for k in ("ProcessName", "NewProcessName", "Image"):
+                    if parsed_ed.get(k) and str(parsed_ed[k]).strip():
+                        ed_procs.add(os.path.basename(str(parsed_ed[k]).strip()))
+                for k in ("ServiceName", "Service"):
+                    if parsed_ed.get(k) and str(parsed_ed[k]).strip():
+                        ed_services.add(str(parsed_ed[k]).strip())
+                for k in ("Status", "SubStatus", "ErrorCode"):
+                    if parsed_ed.get(k) and str(parsed_ed[k]).strip() and str(parsed_ed[k]).strip() != "0x0":
+                        ed_statuses.add(str(parsed_ed[k]).strip())
+                for k in ("IpAddress", "SourceAddress", "ClientAddress"):
+                    if parsed_ed.get(k) and str(parsed_ed[k]).strip() and str(parsed_ed[k]).strip() not in ("-", "127.0.0.1", "::1"):
+                        ed_ips.add(str(parsed_ed[k]).strip())
+        except Exception:
+            pass
+
+    all_users = list(set(users_raw) | ed_users)
+    all_users = [u for u in all_users if u and u.lower() not in ("nan", "none", "null")]
+    users_display = ", ".join(all_users[:3]) + (f" (+{len(all_users)-3} more)" if len(all_users) > 3 else "") if all_users else "SYSTEM (S-1-5-18)"
+
+    lvl_col = [c for c in ["LevelName", "levelname"] if c in records.columns]
+    lvl_dist = records[lvl_col[0]].value_counts().to_dict() if lvl_col else {}
+    lvl_parts = []
+    for l_name, cnt in lvl_dist.items():
+        if not l_name or str(l_name).lower() in ("nan", "none", "0"):
+            continue
+        lvl_parts.append(f"**{l_name}**: {cnt:,}")
+    severity_str = " • ".join(lvl_parts) if lvl_parts else "Standard Security/Audit Stream"
+
+    eid_col = [c for c in ["EventID", "event_id"] if c in records.columns]
+    top_eids = records[eid_col[0]].value_counts().head(3).to_dict() if eid_col else {}
+    eid_parts = []
+    for eid_val, cnt in top_eids.items():
+        desc = WINDOWS_EVENT_DESCRIPTIONS.get(str(eid_val), "")
+        desc_s = f" (*{desc}*)" if desc else ""
+        eid_parts.append(f"**Event {eid_val}**{desc_s}: **{cnt:,}**")
+    top_eids_str = "<br>".join(eid_parts) if eid_parts else "N/A"
+
+    tpl_count = len(templates)
+    dedup_comp = max(0.0, (1.0 - (tpl_count / match_cnt)) * 100.0) if match_cnt > 0 and tpl_count > 0 else 0.0
+    scope_pct = (match_cnt / total_scope_records * 100.0) if total_scope_records > 0 else 100.0
+
+    lead_query = query.strip()
+    resp = f"### 🔍 Forensic Findings\n\n"
+
+    # Conversational opening directly answering the question
+    if qf.entity_filters.process_id:
+        proc_val = qf.entity_filters.process_id
+        resp += f"Based on the analysis of **Process ID `{proc_val}`**, we identified **{match_cnt:,} canonical event(s)** in `{scope_label}`. "
+        if ed_procs:
+            resp += f"The process corresponds to **`{', '.join(list(ed_procs)[:2])}`**, "
+        resp += f"active across a span of **{duration_str}**.\n\n"
+    elif qf.entity_filters.user_id:
+        user_val = qf.entity_filters.user_id
+        resp += f"Forensic analysis for user **`{user_val}`** identified **{match_cnt:,} event(s)** in `{scope_label}` across system(s) **{hosts_str}**.\n\n"
+    elif qf.event_id:
+        eid_val = qf.event_id
+        desc = WINDOWS_EVENT_DESCRIPTIONS.get(str(eid_val), "Windows Event")
+        resp += f"Identified **{match_cnt:,} occurrence(s)** of **Event ID `{eid_val}`** (*{desc}*) in `{scope_label}`.\n\n"
+    elif qf.level and qf.level.lower() in ("error", "critical"):
+        resp += f"Detected **{match_cnt:,} `{qf.level.upper()}` severity event(s)** in `{scope_label}` over the monitored timeframe.\n\n"
+    else:
+        resp += f"Identified **{match_cnt:,} canonical event(s)** matching *\"{lead_query}\"* in `{scope_label}` ({scope_pct:.1f}% of loaded scope).\n\n"
+
+    # Centered Forensic Evidence Statistics Card ("The Stats Behind It")
+    resp += "#### 📊 Forensic Evidence Statistics\n\n"
+    resp += "| 🎯 Matched Records | ⏱️ Time Window (UTC) | 💻 Workstation(s) | 👤 Primary Accounts |\n"
+    resp += "| :--- | :--- | :--- | :--- |\n"
+    resp += f"| **{match_cnt:,}** events ({scope_pct:.1f}% of scope) | `{time_min}` $\\rightarrow$ `{time_max}`<br>*(Duration: {duration_str})* | **{hosts_str}** | **{users_display}** |\n\n"
+
+    resp += "| ⚡ Severity Distribution | 🏷️ Top Event Distribution | 🗜️ Drain3 Deduplication |\n"
+    resp += "| :--- | :--- | :--- |\n"
+    resp += f"| {severity_str} | {top_eids_str} | **{tpl_count}** template(s) for **{match_cnt:,}** events<br>*({dedup_comp:.1f}% compression)* |\n\n"
+
+    # Granular Technical Insights (Metadata & Payload Deep Dive)
+    resp += "#### 🔎 Technical Details & Payload Highlights\n"
+    insights_found = False
+
+    if ed_procs:
+        resp += f"- **Processes / Binaries Identified:** `{', '.join(list(ed_procs)[:5])}`\n"
+        insights_found = True
+    if ed_services:
+        resp += f"- **Services / Daemons Active:** `{', '.join(list(ed_services)[:5])}`\n"
+        insights_found = True
+    if ed_statuses:
+        status_explanations = []
+        for s in list(ed_statuses)[:3]:
+            if s.upper() == "0XC000006D":
+                status_explanations.append(f"`{s}` (STATUS_LOGON_FAILURE - bad credentials)")
+            elif s.upper() == "0XC0000064":
+                status_explanations.append(f"`{s}` (STATUS_NO_SUCH_USER)")
+            elif s.upper() == "0XC0000234":
+                status_explanations.append(f"`{s}` (STATUS_ACCOUNT_LOCKED_OUT)")
+            else:
+                status_explanations.append(f"`{s}`")
+        resp += f"- **Reported Status Codes:** {', '.join(status_explanations)}\n"
+        insights_found = True
+    if ed_ips:
+        resp += f"- **Remote IP Addresses:** `{', '.join(list(ed_ips)[:5])}`\n"
+        insights_found = True
+
+    prov_cols = [c for c in ["Provider", "provider"] if c in records.columns]
+    if prov_cols:
+        top_provs = records[prov_cols[0]].value_counts().head(3).to_dict()
+        prov_items = [f"`{p}` ({c:,})" for p, c in top_provs.items() if p]
+        if prov_items:
+            resp += f"- **Primary Logging Providers:** {', '.join(prov_items)}\n"
+            insights_found = True
+
+    if not insights_found:
+        resp += f"- Events occurred across **{len(hosts)}** host(s) and **{len(all_users) or 1}** security context(s).\n"
+
+    resp += "\n#### 🛡️ Forensic Assessment & Next Steps\n"
+    if qf.event_id == "4625" or "4625" in top_eids:
+        resp += "> ⚠️ **Security Advisory:** Logon failures detected. Correlate with subsequent Event 4624 (Successful Logon) from the same source IP or user within 15 minutes to identify brute-force or credential stuffing compromises.\n"
+    elif "7" in top_eids or "disk" in str(records.get("Provider", "")).lower():
+        resp += "> ⚠️ **System Reliability Advisory:** Device bad block / disk I/O errors detected. Validate physical drive health using SMART utilities and verify backup integrity immediately.\n"
+    elif qf.entity_filters.process_id:
+        resp += f"> 💡 **Forensic Step:** Inspect child process execution trees and network sockets spawned by Process ID `{qf.entity_filters.process_id}` using Sysmon (Event ID 1 / 3) if available.\n"
+    else:
+        resp += "> 💡 **Traceability Guarantee:** Every record summarized above is preserved in full 23-attribute fidelity below with complete raw XML and JSON payloads.\n"
+
+    return resp
 
 
 # ------------------------------------------------------------------------------
@@ -1371,20 +1725,25 @@ elif st.session_state["active_tab"] == "viewer":
                 sort_symbol = "↑" if sort_asc else "↓"
                 th_col_widths = [1.2, 1.8, 1.1, 1.1, 1.1, 2.2, 1.8, 1.8, 1.1]
 
-                header_html = f"""
-                <div style="display: flex; background-color: #0F172A; border-radius: 6px; padding: 10px 10px; margin-bottom: 4px; align-items: center; border-bottom: 2px solid #1E88E5;">
-                    <div style="flex: 1.2; font-size: 0.78rem; font-weight: 800; color: #F59E0B; text-transform: uppercase; letter-spacing: 0.05em;">Record # {sort_symbol}</div>
-                    <div style="flex: 1.8; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Time (UTC)</div>
-                    <div style="flex: 1.1; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Level</div>
-                    <div style="flex: 1.1; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Event ID</div>
-                    <div style="flex: 1.1; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Name</div>
-                    <div style="flex: 2.2; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Provider</div>
-                    <div style="flex: 1.8; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Channel</div>
-                    <div style="flex: 1.8; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em;">Computer</div>
-                    <div style="flex: 1.1; font-size: 0.78rem; font-weight: 700; color: #F8FAFC; text-transform: uppercase; letter-spacing: 0.05em; text-align: center;">Action</div>
-                </div>
-                """
-                st.markdown(header_html, unsafe_allow_html=True)
+                th_c1, th_c2, th_c3, th_c4, th_c5, th_c6, th_c7, th_c8, th_c9 = st.columns(th_col_widths)
+                with th_c1:
+                    st.markdown(f"<span class='th-cell'>Record # {sort_symbol}</span>", unsafe_allow_html=True)
+                with th_c2:
+                    st.markdown("<span class='th-cell'>Time (UTC)</span>", unsafe_allow_html=True)
+                with th_c3:
+                    st.markdown("<span class='th-cell'>Level</span>", unsafe_allow_html=True)
+                with th_c4:
+                    st.markdown("<span class='th-cell'>Event ID</span>", unsafe_allow_html=True)
+                with th_c5:
+                    st.markdown("<span class='th-cell'>Task / Name</span>", unsafe_allow_html=True)
+                with th_c6:
+                    st.markdown("<span class='th-cell'>Provider</span>", unsafe_allow_html=True)
+                with th_c7:
+                    st.markdown("<span class='th-cell'>Channel</span>", unsafe_allow_html=True)
+                with th_c8:
+                    st.markdown("<span class='th-cell'>Computer</span>", unsafe_allow_html=True)
+                with th_c9:
+                    st.markdown("<span class='th-cell' style='text-align: center;'>Action</span>", unsafe_allow_html=True)
 
                 # --------------------------------------------------------------
                 # TABLE ROWS & INLINE EVENT DATA DRAWER
@@ -1854,9 +2213,23 @@ elif st.session_state["active_tab"] == "assistant":
             )
 
             with st.spinner("Thinking... Parsing NLP query, searching vector index, and verifying DuckDB evidence..."):
-                # Step 1: Parse NLP query
+                # Step 1: Discover dataset time bounds to anchor relative queries
+                time_bounds = None
+                max_ref_time = None
+                try:
+                    tb = conn.execute("SELECT MIN(TimeCreated), MAX(TimeCreated) FROM canonical_logs").fetchone()
+                    if tb and tb[0] and tb[1]:
+                        time_bounds = (str(tb[0]), str(tb[1]))
+                        try:
+                            max_ref_time = date_parser.parse(str(tb[1]))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Step 2: Parse NLP query
                 parser = get_query_parser()
-                qf = parser.parse_query(active_query)
+                qf = parser.parse_query(active_query, reference_time=max_ref_time, data_bounds=time_bounds)
 
                 time_range_str = f"{qf.time_range.start_utc} to {qf.time_range.end_utc} (UTC)" if qf.time_range else "Unbounded"
                 entities_str = ", ".join(f"{k}={v}" for k, v in qf.entity_filters.to_dict().items() if v) or "None"
@@ -1871,7 +2244,7 @@ elif st.session_state["active_tab"] == "assistant":
                     "semantic_query": qf.semantic_query,
                 }
 
-                # Step 2: Pass 1 Vector Search on Templates with pre-filtering
+                # Step 3: Semantic Vector Search on Templates
                 v_idx = get_vector_index(get_embedder())
                 qdrant_filters: Dict[str, Any] = {}
                 if qf.source_type:
@@ -1889,24 +2262,18 @@ elif st.session_state["active_tab"] == "assistant":
                     top_k=5,
                 )
 
-                candidate_rec_ids: List[str] = []
-                if template_matches:
-                    inst_map = v_idx.resolve_search_results_to_instances(conn, template_matches)
-                    for ids in inst_map.values():
-                        candidate_rec_ids.extend(ids)
-
-                # Step 3: Pass 2 Evidentiary Record Execution via DuckDB
+                # Step 4: Canonical DuckDB Execution
                 executor = get_query_executor()
-                matched_records = executor.execute_query(
-                    conn=conn,
-                    query_filter=qf,
-                    candidate_record_ids=candidate_rec_ids if candidate_rec_ids else None,
-                    canonical_table="canonical_logs",
-                    limit=500,
+                has_metadata_filters = (
+                    qf.entity_filters.has_any() or
+                    bool(qf.event_id) or
+                    bool(qf.level) or
+                    bool(qf.source_type) or
+                    bool(qf.time_range)
                 )
 
-                # Fallback to direct structured filter if vector candidates yielded no intersection
-                if matched_records.empty and (qf.entity_filters.has_any() or qf.event_id or qf.time_range or qf.level):
+                if has_metadata_filters:
+                    # Explicit metadata attributes present: DuckDB is primary source of truth
                     matched_records = executor.execute_query(
                         conn=conn,
                         query_filter=qf,
@@ -1914,34 +2281,42 @@ elif st.session_state["active_tab"] == "assistant":
                         canonical_table="canonical_logs",
                         limit=500,
                     )
-
-                # Build narrative response
-                match_cnt = len(matched_records)
-                resp_text = f"### 🔍 Forensic Findings\n\n"
-                resp_text += f"**Question:** *\"{active_query}\"*\n\n"
-                resp_text += f"**Identified Intent:** `{qf.intent.upper()}` | **Active Scope:** `{scope_label}`\n\n"
-
-                if qf.intent == "ambiguous" and qf.clarifying_question:
-                    resp_text += f"> 💡 **Clarification Needed:** {qf.clarifying_question}\n\n"
-
-                if match_cnt > 0:
-                    time_cols = [c for c in ["TimeCreated", "time_created_utc"] if c in matched_records.columns]
-                    time_min = matched_records[time_cols[0]].min() if time_cols else "N/A"
-                    time_max = matched_records[time_cols[0]].max() if time_cols else "N/A"
-
-                    host_cols = [c for c in ["Computer", "computer"] if c in matched_records.columns]
-                    hosts = [str(h) for h in matched_records[host_cols[0]].dropna().unique() if str(h).strip()] if host_cols else []
-                    hosts_str = ", ".join(hosts[:3]) + (f" (+{len(hosts)-3} more)" if len(hosts) > 3 else "") if hosts else "N/A"
-
-                    resp_text += f"#### 📊 Key Evidence Summary\n"
-                    resp_text += f"- **Matched Records:** **{match_cnt:,}** canonical event(s)\n"
-                    resp_text += f"- **Time Window:** `{time_min}` $\\rightarrow$ `{time_max}`\n"
-                    resp_text += f"- **Affected System(s):** `{hosts_str}`\n"
-                    resp_text += f"- **Clustered Templates:** `{len(template_matches)}` pattern(s)\n\n"
-                    resp_text += "You can inspect the matched Drain3 templates and exact canonical evidence records below."
                 else:
-                    resp_text += f"❌ **No matching events found** for the parsed filters in `{scope_label}`.\n\n"
-                    resp_text += "Try broadening the search query or selecting a different log file in the sidebar."
+                    # Semantic query: intersect with vector candidate template instances
+                    candidate_rec_ids: List[str] = []
+                    if template_matches:
+                        inst_map = v_idx.resolve_search_results_to_instances(conn, template_matches)
+                        for ids in inst_map.values():
+                            candidate_rec_ids.extend(ids)
+
+                    matched_records = executor.execute_query(
+                        conn=conn,
+                        query_filter=qf,
+                        candidate_record_ids=candidate_rec_ids if candidate_rec_ids else None,
+                        canonical_table="canonical_logs",
+                        limit=500,
+                    )
+
+                    # Graceful fallback if vector intersection yielded no records
+                    if matched_records.empty:
+                        matched_records = executor.execute_query(
+                            conn=conn,
+                            query_filter=qf,
+                            candidate_record_ids=None,
+                            canonical_table="canonical_logs",
+                            limit=500,
+                        )
+
+                # Step 5: Synthesize ChatGPT-Style Conversational Forensic Response
+                resp_text = generate_chatgpt_forensic_response(
+                    query=active_query,
+                    qf=qf,
+                    records=matched_records,
+                    templates=template_matches,
+                    scope_label=scope_label,
+                    total_scope_records=total_rec_count,
+                    conn=conn,
+                )
 
             st.session_state["chatbot_messages"].append(
                 {

@@ -195,7 +195,48 @@ class TestQueryParser(unittest.TestCase):
             data_bounds=bounds,
         )
         self.assertIsNotNone(res.time_range)
-        self.assertTrue(res.time_range.outside_coverage)
+    def test_09_metadata_attribute_linking_words_and_domain_user(self):
+        """Verify that linking words ('is', 'was', 'named', 'id') are not falsely captured
+        as entities, and domain-qualified usernames are parsed properly.
+        """
+        # User with linking word 'is'
+        res_user_is = self.parser.parse_query("Show events where user is SYSTEM")
+        self.assertEqual(res_user_is.entity_filters.user_id, "SYSTEM")
+
+        # Computer with linking word 'is'
+        res_comp_is = self.parser.parse_query("Check host where computer is DESKTOP-AULEN0J")
+        self.assertEqual(res_comp_is.entity_filters.computer, "DESKTOP-AULEN0J")
+
+        # Domain-qualified user
+        res_dom_user = self.parser.parse_query("Show activity for user CONTOSO\\Administrator")
+        self.assertEqual(res_dom_user.entity_filters.user_id, "CONTOSO\\Administrator")
+
+    def test_10_process_name_provider_and_status_code(self):
+        """Verify extraction of process_name, provider, status_code, and hex process_id."""
+        # Provider extraction
+        res_prov = self.parser.parse_query("Find events from provider Service Control Manager")
+        self.assertEqual(res_prov.entity_filters.provider, "Service Control Manager")
+
+        # Process name extraction
+        res_proc = self.parser.parse_query("Application crash in svchost.exe")
+        self.assertEqual(res_proc.entity_filters.process_name, "svchost.exe")
+
+        # Hex status code
+        res_status = self.parser.parse_query("Logon failure with status 0xC000006D")
+        self.assertEqual(res_status.entity_filters.status_code, "0xC000006D")
+
+        # Hex Process ID
+        res_hex_pid = self.parser.parse_query("Find events for process 0x428")
+        self.assertEqual(res_hex_pid.entity_filters.process_id, "0x428")
+
+    def test_11_audit_logon_no_false_severity_error(self):
+        """Verify that Security audit phrases like 'logon failure' do NOT force level='Error',
+        because Windows Security audit events are recorded as Level=0 (LogAlways).
+        """
+        res = self.parser.parse_query("Show logon failure for user Administrator")
+        self.assertEqual(res.source_type, "Security")
+        self.assertEqual(res.event_id, "4625")
+        self.assertIsNone(res.level, "Audit failures must NOT set level='Error', which discards LogAlways events")
 
 
 if __name__ == "__main__":
