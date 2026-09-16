@@ -361,7 +361,156 @@ class SemanticRowSerializer:
 
 
 # ==============================================================================
-# 5. FORENSIC CHUNK DATA STRUCTURE
+# 5. ROW-LEVEL SELF-CONTAINED DOCUMENT SERIALIZER (BLUEPRINT STEP 1)
+# ==============================================================================
+
+class RowDocumentSerializer:
+    """Serializes a single log record across all 23 columns into an independent,
+    self-contained key-value text document.
+
+    Blueprint Specification:
+      - Does not slice columns horizontally.
+      - Treats each row as an independent document containing full 23-column context.
+      - Produces a structured key-value string (e.g. Timestamp: ... | Service: ... | Error: ...).
+      - Applies embedding hygiene: Omits null/empty fields dynamically.
+      - Truncates verbose text payloads (Message/EventData) to avoid exceeding 512 tokens.
+    """
+
+    PRIORITY_COLUMNS: List[str] = [
+        "TimeCreated",
+        "RecordID",
+        "EventID",
+        "LevelName",
+        "Level",
+        "Channel",
+        "Computer",
+        "UserID",
+        "Provider",
+        "Task",
+        "Opcode",
+        "Keywords",
+        "ProcessID",
+        "ThreadID",
+        "EventSourceName",
+        "ActivityID",
+        "RelatedActivityID",
+        "Version",
+        "Qualifiers",
+        "Message",
+        "EventData",
+        "UserData",
+    ]
+
+    def __init__(self, max_payload_chars: int = 300):
+        self.max_payload_chars = max_payload_chars
+
+    def serialize(self, row_dict: Dict[str, Any]) -> str:
+        """Converts a full 23-column row dictionary into a self-contained key-value string."""
+        parts: List[str] = []
+        handled_keys = set()
+
+        # 1. Standard priority columns in logical forensic order
+        for col in self.PRIORITY_COLUMNS:
+            if col in row_dict:
+                handled_keys.add(col)
+                val = row_dict[col]
+                if not is_null_or_empty(val):
+                    val_str = " ".join(str(val).strip().split())
+                    if col in ("Message", "EventData", "UserData") and len(val_str) > self.max_payload_chars:
+                        val_str = val_str[: self.max_payload_chars] + "..."
+                    parts.append(f"{col}: {val_str}")
+
+        # 2. Append any remaining non-empty custom columns
+        for col, val in row_dict.items():
+            if col not in handled_keys and col not in ("row_id", "chunk_id"):
+                if not is_null_or_empty(val):
+                    val_str = " ".join(str(val).strip().split())
+                    if len(val_str) > self.max_payload_chars:
+                        val_str = val_str[: self.max_payload_chars] + "..."
+                    parts.append(f"{col}: {val_str}")
+
+        if not parts:
+            return "LogRecord: [Empty attributes]"
+
+        return " | ".join(parts)
+
+
+def transform_rows_as_documents(
+    df: Union[pd.DataFrame, str],
+    max_payload_chars: int = 300,
+    id_column: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Transforms every row in the dataset into an independent, self-contained document chunk.
+
+    Blueprint Specification (Step 1):
+      - Treats each row as an independent document (1 row = 1 document).
+      - Converts each row into a structured key-value string containing full 23-column context.
+      - Preserves 100% of rows and columns without horizontal column slicing.
+
+    Returns:
+        List of chunk dictionaries formatted as:
+        [
+            {
+                "row_id": str,
+                "chunk_id": str,
+                "text": str,
+                "metadata": Dict[str, Any]
+            }, ...
+        ]
+    """
+    df_loaded = load_input_data(df)
+    if df_loaded is None or df_loaded.empty:
+        return []
+
+    serializer = RowDocumentSerializer(max_payload_chars=max_payload_chars)
+    documents: List[Dict[str, Any]] = []
+
+    for idx, row in df_loaded.iterrows():
+        row_dict = row.to_dict()
+
+        # Determine deterministic row_id
+        if id_column and id_column in row_dict and not is_null_or_empty(row_dict[id_column]):
+            row_id = str(row_dict[id_column]).strip()
+        elif "RecordID" in row_dict and not is_null_or_empty(row_dict["RecordID"]):
+            row_id = str(row_dict["RecordID"]).strip()
+        elif "row_id" in row_dict and not is_null_or_empty(row_dict["row_id"]):
+            row_id = str(row_dict["row_id"]).strip()
+        else:
+            host_val = clean_string_scalar(row_dict.get("Computer") or row_dict.get("host")) or "HOST"
+            ts_val = clean_string_scalar(row_dict.get("TimeCreated") or row_dict.get("timestamp")) or "TIME"
+            row_id = str(uuid.uuid5(UUID5_NAMESPACE_DFIR, f"{host_val}:{ts_val}:{idx}"))
+
+        text_doc = serializer.serialize(row_dict)
+
+        # Build clean metadata payload preserving all 23 columns
+        meta: Dict[str, Any] = {
+            "row_id": row_id,
+            "chunk_id": row_id,
+            "raw_row_count": 1,
+            "source_row_index": idx,
+        }
+        for k, v in row_dict.items():
+            meta[k] = None if is_null_or_empty(v) else v
+
+        # Add top-level convenience aliases
+        meta["start_time"] = meta.get("TimeCreated") or meta.get("timestamp")
+        meta["end_time"] = meta["start_time"]
+        meta["host"] = meta.get("Computer") or meta.get("host")
+        meta["event_ids"] = [meta.get("EventID")] if meta.get("EventID") else []
+        meta["levels"] = [meta.get("LevelName") or meta.get("level")] if (meta.get("LevelName") or meta.get("level")) else []
+
+        documents.append({
+            "row_id": row_id,
+            "chunk_id": row_id,
+            "text": text_doc,
+            "metadata": meta,
+        })
+
+    return documents
+
+
+# ==============================================================================
+# 6. FORENSIC CHUNK DATA STRUCTURE
 # ==============================================================================
 
 @dataclass
@@ -747,6 +896,7 @@ class DFIRLogTransformerPipeline:
 
 def preprocess_and_chunk_windows_logs(
     df: Union[pd.DataFrame, str],
+    chunk_mode: str = "window",
     window_duration_minutes: int = 10,
     window_overlap_minutes: int = 2,
     max_tokens_per_chunk: int = 512,
@@ -754,11 +904,19 @@ def preprocess_and_chunk_windows_logs(
     max_details_chars: int = 300,
     model_name_or_tokenizer: Any = "BAAI/bge-small-en-v1.5",
     group_by_host: bool = False,
+    id_column: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Preprocesses and chunks Windows log DataFrames or files for embedding models.
 
+    Supports two chunking modes:
+      1. chunk_mode="window" (Default): Chronological sliding time window sessionizer
+         (10-min window, 2-min overlap, token burst subdivision).
+      2. chunk_mode="row": Row-level document chunking (Blueprint Step 1:
+         1 row = 1 self-contained document containing full 23-column context).
+
     Args:
         df: In-memory pandas DataFrame or file path (CSV or JSONL).
+        chunk_mode: "window" for temporal sliding window, or "row" for self-contained row documents.
         window_duration_minutes: Sliding time window duration (default: 10 minutes).
         window_overlap_minutes: Overlap duration between consecutive windows (default: 2 minutes).
         max_tokens_per_chunk: Hard token budget per chunk (default: 512 tokens).
@@ -766,19 +924,30 @@ def preprocess_and_chunk_windows_logs(
         max_details_chars: Character ceiling for details/message field (default: 300 characters).
         model_name_or_tokenizer: Model name string or tokenizer instance for token estimation.
         group_by_host: If True, partitions timeline per host before windowing (default: False).
+        id_column: Explicit column to use as unique row_id (used in row mode).
 
     Returns:
         List of chunk dictionaries formatted as:
         {
-            "chunk_id": str,          # Deterministic RFC 4122 UUIDv5 (derived from host + start_timestamp)
-            "text": str,              # Formatted semantic block
-            "metadata": dict          # Structured payload for Qdrant traversal
+            "chunk_id": str,          # Deterministic UUIDv5 or row_id
+            "row_id": str,            # Primary record identifier
+            "text": str,              # Formatted semantic key-value block
+            "metadata": dict          # Full structured payload
         }
     """
     df_loaded = load_input_data(df)
     if df_loaded is None or df_loaded.empty:
         return []
 
+    # Blueprint Step 1: Row-level self-contained documents
+    if chunk_mode == "row":
+        return transform_rows_as_documents(
+            df_loaded,
+            max_payload_chars=max_details_chars,
+            id_column=id_column,
+        )
+
+    # Standard sliding-window sessionizer
     pipeline = DFIRLogTransformerPipeline(
         window_duration_minutes=window_duration_minutes,
         window_overlap_minutes=window_overlap_minutes,
@@ -791,6 +960,123 @@ def preprocess_and_chunk_windows_logs(
 
     chunks = pipeline.transform_dataframe(df_loaded)
     return [c.to_dict() for c in chunks]
+
+
+# ==============================================================================
+# 9. HYBRID IN-MEMORY STRUCTURED ENGINE & BATCHING (BLUEPRINT STEPS 2, 3, 4)
+# ==============================================================================
+
+class InMemoryLogStore:
+    """In-memory structured query engine using DuckDB with seamless zero-file SQLite fallback.
+
+    Blueprint Specification (Step 2 & 3):
+      - Stores the entire 23-column dataset in-memory with primary key row_id.
+      - Provides sub-millisecond filtering and complete 23-column retrieval.
+      - Enables Pass 2 of the two-pass retrieval strategy (fetching complete records
+        for candidate row_ids retrieved via vector search).
+      - Zero persistent database files created on disk.
+    """
+
+    def __init__(self, df: Union[pd.DataFrame, str], id_column: Optional[str] = None):
+        self.df = load_input_data(df)
+        if "row_id" not in self.df.columns:
+            if id_column and id_column in self.df.columns:
+                self.df["row_id"] = self.df[id_column].astype(str)
+            elif "RecordID" in self.df.columns and not self.df["RecordID"].replace("", pd.NA).isna().all():
+                self.df["row_id"] = self.df["RecordID"].astype(str)
+            else:
+                self.df["row_id"] = [str(i) for i in range(len(self.df))]
+
+        self._duckdb_conn = None
+        self._sqlite_conn = None
+
+        try:
+            import duckdb
+            self._duckdb_conn = duckdb.connect(":memory:")
+            self._duckdb_conn.register("logs", self.df)
+        except Exception:
+            import sqlite3
+            self._sqlite_conn = sqlite3.connect(":memory:")
+            self.df.to_sql("logs", self._sqlite_conn, index=False, if_exists="replace")
+
+    def fetch_by_row_ids(self, row_ids: List[str]) -> pd.DataFrame:
+        """Pass 2 (Fetch): Queries structured store using row_ids to retrieve
+        the complete 23-column records.
+        """
+        if not row_ids:
+            return pd.DataFrame(columns=self.df.columns)
+
+        if self._duckdb_conn is not None:
+            clean_ids = [str(rid).replace("'", "''") for rid in row_ids]
+            placeholders = ", ".join(f"'{cid}'" for cid in clean_ids)
+            query = f"SELECT * FROM logs WHERE row_id IN ({placeholders})"
+            return self._duckdb_conn.execute(query).df()
+        elif self._sqlite_conn is not None:
+            placeholders = ", ".join("?" for _ in row_ids)
+            query = f"SELECT * FROM logs WHERE row_id IN ({placeholders})"
+            return pd.read_sql_query(query, self._sqlite_conn, params=[str(r) for r in row_ids])
+        else:
+            return self.df[self.df["row_id"].isin([str(r) for r in row_ids])].copy()
+
+    def filter_by_sql(self, where_clause: str) -> List[str]:
+        """Executes fast SQL filter and returns matching row_ids."""
+        query = f"SELECT row_id FROM logs WHERE {where_clause}"
+        if self._duckdb_conn is not None:
+            res = self._duckdb_conn.execute(query).fetchall()
+            return [str(r[0]) for r in res]
+        elif self._sqlite_conn is not None:
+            cur = self._sqlite_conn.cursor()
+            cur.execute(query)
+            return [str(r[0]) for r in cur.fetchall()]
+        return []
+
+
+def format_llm_batch(
+    records: Union[pd.DataFrame, List[Dict[str, Any]]],
+    batch_size: int = 15,
+    preferred_columns: Optional[List[str]] = None,
+) -> List[str]:
+    """Blueprint Specification (Step 4):
+    Groups fetched rows into small batches (e.g. 10–20 rows) and prepends
+    the column headers to the top of each batch for LLM analysis.
+    """
+    if isinstance(records, list):
+        df = pd.DataFrame(records)
+    elif isinstance(records, pd.DataFrame):
+        df = records.copy()
+    else:
+        return []
+
+    if df.empty:
+        return []
+
+    if preferred_columns:
+        cols = [c for c in preferred_columns if c in df.columns]
+        if cols:
+            df = df[cols]
+
+    batches: List[str] = []
+    total_rows = len(df)
+
+    for start_idx in range(0, total_rows, batch_size):
+        sub_df = df.iloc[start_idx : start_idx + batch_size]
+        headers = [str(c) for c in sub_df.columns]
+        header_line = "| " + " | ".join(headers) + " |"
+        sep_line = "| " + " | ".join(["---"] * len(headers)) + " |"
+        row_lines = []
+        for _, row in sub_df.iterrows():
+            row_vals = [str(row[c]).replace("\n", " ").replace("|", "\\|") for c in sub_df.columns]
+            row_lines.append("| " + " | ".join(row_vals) + " |")
+
+        table_str = "\n".join([header_line, sep_line] + row_lines)
+        header_context = (
+            f"### LOG BATCH [{start_idx + 1} to {min(start_idx + batch_size, total_rows)} of {total_rows}]\n"
+            f"Columns: {', '.join(sub_df.columns)}\n\n"
+            f"{table_str}"
+        )
+        batches.append(header_context)
+
+    return batches
 
 
 # ==============================================================================

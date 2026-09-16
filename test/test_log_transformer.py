@@ -40,9 +40,13 @@ if PARENT_DIR not in sys.path:
 from log_transformer import (
     ColumnNormalizer,
     SemanticRowSerializer,
+    RowDocumentSerializer,
     ChronologicalWindowChunker,
     TokenEstimator,
     preprocess_and_chunk_windows_logs,
+    transform_rows_as_documents,
+    InMemoryLogStore,
+    format_llm_batch,
     load_input_data,
     generate_chunk_id,
     sort_with_clock_skew,
@@ -411,6 +415,117 @@ class TestLogTransformer(unittest.TestCase):
         self.assertIn("EventID: 7045 (Warning)", chunk["text"])
         self.assertIn("User: NETWORK_SERVICE", chunk["text"])
         self.assertIn("Details: Service created successfully", chunk["text"])
+
+    def test_09_row_level_self_contained_documents(self):
+        """Blueprint Step 1: Transform each of N rows into an independent self-contained document
+        chunk with full 23-column context without horizontal slicing.
+        """
+        rows = []
+        for i in range(50):
+            rows.append({
+                "RecordID": f"{1000 + i}",
+                "TimeCreated": f"2026-09-14T08:{i % 60:02d}:00Z",
+                "EventID": "4625" if i % 2 == 0 else "4624",
+                "Level": "2" if i % 2 == 0 else "4",
+                "LevelName": "Error" if i % 2 == 0 else "Information",
+                "Channel": "Security",
+                "Provider": "Microsoft-Windows-Security-Auditing",
+                "ProviderGuid": "{54849625-5478-4994-A5BA-3E3B0328C30D}",
+                "EventSourceName": "",
+                "Task": "Logon",
+                "Opcode": "Info",
+                "Keywords": "Audit Failure" if i % 2 == 0 else "Audit Success",
+                "Computer": "SEC-SRV-01",
+                "UserID": f"S-1-5-21-{i:04d}",
+                "ProcessID": "672",
+                "ThreadID": "1420",
+                "Version": "2",
+                "ActivityID": "{00000000-0000-0000-0000-000000000000}",
+                "RelatedActivityID": "",
+                "Qualifiers": "",
+                "EventData": f'{{"TargetUserName": "user_{i}", "Status": "0xC000006A"}}',
+                "UserData": "",
+                "Message": f"Logon attempt for user_{i} was processed.",
+            })
+
+        df = pd.DataFrame(rows)
+
+        # 1. Test transform_rows_as_documents directly
+        docs = transform_rows_as_documents(df)
+        self.assertEqual(len(docs), 50, "Every single row must become an independent document (50 in -> 50 out)")
+
+        # Verify Document 0 structure
+        doc0 = docs[0]
+        self.assertEqual(doc0["row_id"], "1000")
+        self.assertEqual(doc0["chunk_id"], "1000")
+
+        # Verify structured key-value serialization
+        text0 = doc0["text"]
+        self.assertIn("TimeCreated: 2026-09-14T08:00:00Z", text0)
+        self.assertIn("EventID: 4625", text0)
+        self.assertIn("LevelName: Error", text0)
+        self.assertIn("Computer: SEC-SRV-01", text0)
+        self.assertIn("UserID: S-1-5-21-0000", text0)
+        self.assertIn("Message: Logon attempt for user_0 was processed.", text0)
+        self.assertIn("TargetUserName", text0)
+
+        # Verify metadata retains all 23 columns
+        meta0 = doc0["metadata"]
+        self.assertEqual(meta0["row_id"], "1000")
+        self.assertEqual(meta0["raw_row_count"], 1)
+        self.assertEqual(meta0["Computer"], "SEC-SRV-01")
+        self.assertEqual(meta0["EventID"], "4625")
+
+        # 2. Test preprocess_and_chunk_windows_logs with chunk_mode="row"
+        docs_via_entrypoint = preprocess_and_chunk_windows_logs(df, chunk_mode="row")
+        self.assertEqual(len(docs_via_entrypoint), 50)
+        self.assertEqual(docs_via_entrypoint[0]["row_id"], "1000")
+
+    def test_10_duckdb_hybrid_storage_and_two_pass_fetch(self):
+        """Blueprint Step 2 & 3: Hybrid in-memory storage and two-pass retrieval
+        (Pass 1 vector candidates -> Pass 2 complete 23-column fetch).
+        """
+        rows = [
+            {"RecordID": "2001", "EventID": "4625", "Computer": "HOST-A", "Message": "Brute force attempt 1"},
+            {"RecordID": "2002", "EventID": "4624", "Computer": "HOST-A", "Message": "Admin logon"},
+            {"RecordID": "2003", "EventID": "4625", "Computer": "HOST-B", "Message": "Brute force attempt 2"},
+            {"RecordID": "2004", "EventID": "7045", "Computer": "HOST-A", "Message": "Service install"},
+        ]
+        df = pd.DataFrame(rows)
+
+        # Ingest into in-memory structured engine (DuckDB / SQLite fallback)
+        store = InMemoryLogStore(df)
+
+        # Pass 1 simulated: Vector search returned candidate row_ids ['2001', '2003']
+        candidate_ids = ["2001", "2003"]
+
+        # Pass 2: Structured fetch by row_ids
+        fetched_df = store.fetch_by_row_ids(candidate_ids)
+        self.assertEqual(len(fetched_df), 2)
+        fetched_record_ids = set(fetched_df["RecordID"].astype(str).tolist())
+        self.assertEqual(fetched_record_ids, {"2001", "2003"})
+
+        # SQL Filter test
+        filtered_ids = store.filter_by_sql("EventID = '4625'")
+        self.assertEqual(len(filtered_ids), 2)
+        self.assertIn("2001", filtered_ids)
+        self.assertIn("2003", filtered_ids)
+
+    def test_11_llm_batch_formatting(self):
+        """Blueprint Step 4: Batching fetched records for LLM analysis with prepended column headers."""
+        rows = [{"RecordID": f"{i}", "EventID": "4624", "User": f"user_{i}"} for i in range(25)]
+        df = pd.DataFrame(rows)
+
+        batches = format_llm_batch(df, batch_size=10)
+        # 25 rows with batch_size=10 -> 3 batches (10, 10, 5)
+        self.assertEqual(len(batches), 3)
+
+        # Verify header context and schema prepended
+        self.assertIn("### LOG BATCH [1 to 10 of 25]", batches[0])
+        self.assertIn("Columns: RecordID, EventID, User", batches[0])
+        self.assertIn("| RecordID | EventID | User |", batches[0])
+
+        self.assertIn("### LOG BATCH [21 to 25 of 25]", batches[2])
 
 
 if __name__ == "__main__":
