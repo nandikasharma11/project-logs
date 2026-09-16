@@ -321,9 +321,18 @@ class DuckDBTemplateManager:
         except Exception:
             pass
 
+        # Handle migration if template_instances exists with old primary key schema
+        try:
+            inst_cols = [r[0].lower() for r in conn.execute(f"DESCRIBE {self.TABLE_INSTANCES}").fetchall()]
+            if "instance_id" not in inst_cols:
+                conn.execute(f"DROP TABLE {self.TABLE_INSTANCES}")
+        except Exception:
+            pass
+
         conn.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.TABLE_INSTANCES} (
-                event_record_id VARCHAR PRIMARY KEY,
+                instance_id BIGINT,
+                event_record_id VARCHAR,
                 template_id VARCHAR NOT NULL REFERENCES {self.TABLE_TEMPLATES}(template_id),
                 time_created_utc VARCHAR,
                 extracted_variables VARCHAR
@@ -389,13 +398,13 @@ class DuckDBTemplateManager:
         msg_col = col_map.get("message")
         ed_col = col_map.get("event_data")
 
-        # Select only unmapped records (Idempotency Guard)
+        # Select only unmapped records (Idempotency Guard via native rowid)
         unmapped_query = f"""
-            SELECT * FROM {canonical_table}
-            WHERE CAST({rec_col} AS VARCHAR) NOT IN (
-                SELECT event_record_id FROM {self.TABLE_INSTANCES}
+            SELECT rowid AS _canonical_rowid, * FROM {canonical_table}
+            WHERE rowid NOT IN (
+                SELECT instance_id FROM {self.TABLE_INSTANCES} WHERE instance_id IS NOT NULL
             )
-            ORDER BY {time_col if time_col in table_cols else rec_col} ASC
+            ORDER BY rowid ASC
         """
         unmapped_df = conn.execute(unmapped_query).df()
 
@@ -503,6 +512,7 @@ class DuckDBTemplateManager:
 
             # Prepare instance mapping row
             new_instances.append({
+                "instance_id": int(row["_canonical_rowid"]) if "_canonical_rowid" in row else len(new_instances),
                 "event_record_id": rec_id,
                 "template_id": template_id,
                 "time_created_utc": time_created,
@@ -561,7 +571,7 @@ class DuckDBTemplateManager:
             conn.execute(
                 f"""
                 INSERT INTO {self.TABLE_INSTANCES}
-                SELECT event_record_id, template_id, time_created_utc, extracted_variables
+                SELECT instance_id, event_record_id, template_id, time_created_utc, extracted_variables
                 FROM _temp_new_instances
                 """
             )
@@ -614,7 +624,7 @@ class DuckDBTemplateManager:
             SELECT c.*, i.extracted_variables, i.template_id
             FROM {canonical_table} c
             INNER JOIN {self.TABLE_INSTANCES} i
-                ON CAST(c.{rec_col} AS VARCHAR) = i.event_record_id
+                ON (c.rowid = i.instance_id OR CAST(c.{rec_col} AS VARCHAR) = i.event_record_id)
             WHERE i.template_id = ?
             ORDER BY i.time_created_utc ASC, i.event_record_id ASC
         """

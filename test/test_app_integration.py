@@ -96,3 +96,76 @@ def test_app_sync_dataframe_to_duckdb():
     matched = executor.execute_query(test_conn, qf, canonical_table="canonical_logs")
     assert len(matched) == 2
     assert matched["RecordID"].tolist() == ["1001", "1002"]
+
+
+def test_app_sync_duplicate_record_ids_across_channels():
+    """Validates that sync_dataframe_to_duckdb cleanly handles multiple files/channels
+    sharing the same RecordID (e.g. RecordID 1 in Security, System, and Application)
+    without triggering a PRIMARY KEY constraint violation.
+    """
+    test_conn = duckdb.connect(":memory:")
+
+    multi_channel_df = pd.DataFrame([
+        {
+            "RecordID": "1",
+            "TimeCreated": "2026-09-15 14:00:00",
+            "EventID": "4625",
+            "Level": "2",
+            "LevelName": "Error",
+            "Channel": "Security",
+            "Provider": "Microsoft-Windows-Security-Auditing",
+            "Computer": "HOST-01",
+            "ProcessID": "1000",
+            "ThreadID": "10",
+            "UserID": "Admin",
+            "Message": "Security logon failure event",
+            "EventData": "{}",
+            "RawXML": "<Event>1</Event>",
+        },
+        {
+            "RecordID": "1",
+            "TimeCreated": "2026-09-15 14:00:01",
+            "EventID": "7036",
+            "Level": "4",
+            "LevelName": "Information",
+            "Channel": "System",
+            "Provider": "Service Control Manager",
+            "Computer": "HOST-01",
+            "ProcessID": "500",
+            "ThreadID": "11",
+            "UserID": "SYSTEM",
+            "Message": "Service started successfully",
+            "EventData": "{}",
+            "RawXML": "<Event>1</Event>",
+        },
+        {
+            "RecordID": "1",
+            "TimeCreated": "2026-09-15 14:00:02",
+            "EventID": "1000",
+            "Level": "2",
+            "LevelName": "Error",
+            "Channel": "Application",
+            "Provider": "Application Error",
+            "Computer": "HOST-01",
+            "ProcessID": "1200",
+            "ThreadID": "12",
+            "UserID": "User1",
+            "Message": "Application fault occurred",
+            "EventData": "{}",
+            "RawXML": "<Event>1</Event>",
+        },
+    ])
+
+    # Ingest without constraint error
+    res = app.sync_dataframe_to_duckdb(test_conn, multi_channel_df, scope_key="multi_channel_scope", force_resync=True)
+    assert res["records"] == 3
+    assert res["templates"] == 3
+    assert res["vectors"] >= 3
+
+    # Verify 100% evidentiary integrity
+    mgr = app.get_drain3_mgr()
+    integrity = mgr.verify_evidentiary_integrity(test_conn, canonical_table="canonical_logs")
+    assert integrity["integrity_valid"] is True
+    assert integrity["canonical_count"] == 3
+    assert integrity["instance_count"] == 3
+
