@@ -22,6 +22,7 @@ Description:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import duckdb
@@ -215,13 +216,17 @@ class EventQueryExecutor:
 
         # 2. Source Channel Filter: source_type = ?
         if query_filter.source_type:
-            where_clauses.append(f"LOWER({chan_col}) = LOWER(?)")
+            where_clauses.append(f"LOWER(CAST({chan_col} AS VARCHAR)) = LOWER(?)")
             params.append(query_filter.source_type)
 
         # 3. Event ID Filter: event_id = ?
         if query_filter.event_id:
-            where_clauses.append(f"CAST({evid_col} AS VARCHAR) = ?")
-            params.append(str(query_filter.event_id))
+            val_eid = str(query_filter.event_id).strip()
+            val_eid_int = int(val_eid) if val_eid.isdigit() else -1
+            where_clauses.append(
+                f"(TRY_CAST({evid_col} AS BIGINT) = ? OR REGEXP_REPLACE(CAST({evid_col} AS VARCHAR), '\\.0$', '') = ?)"
+            )
+            params.extend([val_eid_int, val_eid])
 
         # 4. Severity Level Filter: supports numeric codes and text labels
         if query_filter.level:
@@ -230,12 +235,12 @@ class EventQueryExecutor:
                 "critical": ["1", "critical"],
                 "error": ["2", "error", "failure", "audit failure"],
                 "warning": ["3", "warning"],
-                "information": ["4", "0", "information", "informational", "info", "audit success"],
+                "information": ["4", "0", "information", "informational", "info", "audit success", "logalways"],
                 "verbose": ["5", "verbose"],
             }
             allowed = lvl_map.get(lvl_clean, [lvl_clean])
             placeholders = ", ".join(["?"] * len(allowed))
-            where_clauses.append(f"LOWER(CAST({lvl_col} AS VARCHAR)) IN ({placeholders})")
+            where_clauses.append(f"LOWER(REGEXP_REPLACE(CAST({lvl_col} AS VARCHAR), '\\.0$', '')) IN ({placeholders})")
             params.extend(allowed)
 
         # 5. Entity Filters:
@@ -245,6 +250,7 @@ class EventQueryExecutor:
         if entities.process_id:
             val_raw = str(entities.process_id).strip()
             val_dec = str(int(val_raw, 16)) if val_raw.lower().startswith("0x") else val_raw
+            val_dec_int = int(val_dec) if val_dec.isdigit() else -1
             try:
                 val_hex = hex(int(val_dec))
             except Exception:
@@ -254,9 +260,9 @@ class EventQueryExecutor:
             clause_hex, p_hex = query_event_data("process_id", val_hex, query_filter.event_id, json_col=ed_col)
             
             if pid_col:
-                pid_clause = f"(CAST({pid_col} AS VARCHAR) = ? OR {clause_dec} OR {clause_hex})"
+                pid_clause = f"((TRY_CAST({pid_col} AS BIGINT) = ? OR REGEXP_REPLACE(CAST({pid_col} AS VARCHAR), '\\.0$', '') = ? OR LOWER(CAST({pid_col} AS VARCHAR)) = ?) OR {clause_dec} OR {clause_hex})"
                 where_clauses.append(pid_clause)
-                params.append(val_dec)
+                params.extend([val_dec_int, val_dec, val_raw.lower()])
                 params.extend(p_dec)
                 params.extend(p_hex)
             else:
@@ -276,7 +282,7 @@ class EventQueryExecutor:
         # Provider
         if getattr(entities, "provider", None) and entities.provider:
             prov_val = str(entities.provider).strip()
-            where_clauses.append(f"LOWER({prov_col}) LIKE ?")
+            where_clauses.append(f"LOWER(CAST({prov_col} AS VARCHAR)) LIKE ?")
             params.append(f"%{prov_val.lower()}%")
 
         # Status Code (e.g. 0xC000006D)
@@ -289,16 +295,22 @@ class EventQueryExecutor:
         # Thread ID
         if entities.thread_id:
             val = str(entities.thread_id).strip()
+            val_int = int(val) if val.isdigit() else -1
             if tid_col:
-                where_clauses.append(f"CAST({tid_col} AS VARCHAR) = ?")
-                params.append(val)
+                where_clauses.append(f"(TRY_CAST({tid_col} AS BIGINT) = ? OR REGEXP_REPLACE(CAST({tid_col} AS VARCHAR), '\\.0$', '') = ?)")
+                params.extend([val_int, val])
 
         # Computer / Hostname
         if entities.computer:
             val = str(entities.computer).strip()
+            clause_comp, p_comp = query_event_data("computer", val, query_filter.event_id, json_col=ed_col)
             if comp_col:
-                where_clauses.append(f"LOWER({comp_col}) = LOWER(?)")
-                params.append(val)
+                where_clauses.append(f"(LOWER(CAST({comp_col} AS VARCHAR)) = LOWER(?) OR LOWER(CAST({comp_col} AS VARCHAR)) LIKE ? OR {clause_comp})")
+                params.extend([val, f"%{val.lower()}%"])
+                params.extend(p_comp)
+            else:
+                where_clauses.append(clause_comp)
+                params.extend(p_comp)
 
         # User ID / Username (check top-level column AND/OR event_data JSON with SID mapping)
         if entities.user_id:
@@ -318,7 +330,7 @@ class EventQueryExecutor:
             for u in cand_users:
                 json_clause, json_params = query_event_data("user_id", u, query_filter.event_id, json_col=ed_col)
                 if uid_col:
-                    user_subclauses.append(f"(LOWER({uid_col}) = LOWER(?) OR {json_clause})")
+                    user_subclauses.append(f"(LOWER(CAST({uid_col} AS VARCHAR)) = LOWER(?) OR {json_clause})")
                     params.append(u)
                     params.extend(json_params)
                 else:
@@ -347,7 +359,7 @@ class EventQueryExecutor:
         # Event Record ID
         if entities.event_record_id:
             val = str(entities.event_record_id).strip()
-            where_clauses.append(f"CAST({rec_col} AS VARCHAR) = ?")
+            where_clauses.append(f"REGEXP_REPLACE(CAST({rec_col} AS VARCHAR), '\\.0$', '') = ?")
             params.append(val)
 
         # 6. Candidate Record IDs Intersect (from Pass 1 vector search)
@@ -355,7 +367,7 @@ class EventQueryExecutor:
             cands = [str(c).strip() for c in candidate_record_ids if str(c).strip()]
             if cands:
                 placeholders = ", ".join(["?"] * len(cands))
-                where_clauses.append(f"CAST({rec_col} AS VARCHAR) IN ({placeholders})")
+                where_clauses.append(f"REGEXP_REPLACE(CAST({rec_col} AS VARCHAR), '\\.0$', '') IN ({placeholders})")
                 params.extend(cands)
             else:
                 # If vector search returned empty set, intersection must be empty

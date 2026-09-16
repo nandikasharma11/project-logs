@@ -965,15 +965,16 @@ def generate_chatgpt_forensic_response(
         if conn is not None and qf.entity_filters.process_id:
             try:
                 pid_query = qf.entity_filters.process_id
+                pid_int = int(pid_query) if pid_query.isdigit() else -1
                 pid_exists = conn.execute(
-                    "SELECT COUNT(*) FROM canonical_logs WHERE CAST(ProcessID AS VARCHAR) = ?",
-                    [pid_query],
+                    "SELECT COUNT(*) FROM canonical_logs WHERE (TRY_CAST(ProcessID AS BIGINT) = ? OR REGEXP_REPLACE(CAST(ProcessID AS VARCHAR), '\\.0$', '') = ?)",
+                    [pid_int, pid_query],
                 ).fetchone()[0]
                 if pid_exists == 0:
                     top_pids = [
                         f"`{r[0]}` ({r[1]:,} events)"
                         for r in conn.execute(
-                            "SELECT ProcessID, COUNT(*) FROM canonical_logs WHERE ProcessID IS NOT NULL AND ProcessID != '' GROUP BY ProcessID ORDER BY COUNT(*) DESC LIMIT 5"
+                            "SELECT REGEXP_REPLACE(CAST(ProcessID AS VARCHAR), '\\.0$', ''), COUNT(*) FROM canonical_logs WHERE ProcessID IS NOT NULL AND ProcessID != '' GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 5"
                         ).fetchall()
                     ]
                     diagnostics.append(
