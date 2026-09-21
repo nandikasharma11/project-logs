@@ -6,11 +6,18 @@ Built with Streamlit and powered by fileconversion.py.
 Features:
 - Dual-Engine Support: Native evtx_dump binary + pure-Python fallback.
 - Multi-Format Export: Convert EVTX to CSV, JSON, JSON Lines (JSONL), or standard Windows XML.
-- Forensic Grid: Essential forensic columns (Record #, Time, Level, Event ID, Name, Provider, Channel, Computer, Action) with inline EVENT DATA drawer.
-- Inline Row Expansion ("EVENT DATA" Drawer): Inspect key-values, Show raw XML, and Show raw JSON.
-- Collapsible "▸ Advanced filters" Accordion: Filter by Event ID, Level, Provider, Channel, Computer, Time, and Keyword.
+- Forensic Grid: Essential forensic columns (Record #, Time, Level, Event ID, Name, Provider,
+  Channel, Computer, Action) with inline EVENT DATA drawer.
+- Inline Row Expansion ("EVENT DATA" Drawer): Inspect key-values, Show raw XML, Show raw JSON,
+  and trace cross-channel causal correlations.
+- Collapsible "▸ Advanced filters" Accordion: Filter by Event ID, Level, Provider, Channel,
+  Computer, Time, and Keyword.
 - 1-Click Export Toolbar: Download current filtered records as CSV, JSON, or XML.
+- Forensic Assistant: Natural Language query parsing, semantic vector retrieval,
+  deduplication traceability matrix, cross-channel causal linking, and Qwen cited reasoning.
 """
+
+from __future__ import annotations
 
 import glob
 import html
@@ -25,35 +32,644 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from dateutil import parser as date_parser
+import duckdb
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 import fileconversion
-
-import duckdb
-from log_templater import DuckDBTemplateManager, Drain3ChannelManager, get_event_family_label
-from stage3_vectorizing import TemplateEmbedder, TemplateVectorIndex, construct_representative_text
-from query_parser import ForensicQueryParser, QueryFilter, TimeRange
-from query_executor import EventQueryExecutor
 from correlation_indexer import CorrelationIndexManager, find_correlated
-from retrieval_pipeline import ForensicRetrievalPipeline, PipelineConfig, PipelineResult, get_llm_backend
+from log_templater import Drain3ChannelManager, DuckDBTemplateManager, get_event_family_label
+from query_executor import EventQueryExecutor
+from query_parser import ForensicQueryParser, QueryFilter, TimeRange
+from retrieval_pipeline import (
+    ForensicRetrievalPipeline,
+    PipelineConfig,
+    PipelineResult,
+    get_llm_backend,
+)
+from stage3_vectorizing import (
+    TemplateEmbedder,
+    TemplateVectorIndex,
+    construct_representative_text,
+)
+
+# ------------------------------------------------------------------------------
+# DYNAMIC MODULE RELOAD & BACKWARD COMPATIBILITY BINDINGS
+# ------------------------------------------------------------------------------
 
 try:
     importlib.reload(fileconversion)
 except Exception:
     pass
 
-convert = getattr(fileconversion, "convert")
-convert_and_load = getattr(fileconversion, "convert_and_load")
-convert_from_path = getattr(fileconversion, "convert_from_path")
-convert_from_upload = getattr(fileconversion, "convert_from_upload")
-record_to_xml = getattr(fileconversion, "record_to_xml")
-records_to_xml = getattr(fileconversion, "records_to_xml")
-CSV_COLUMNS = getattr(fileconversion, "CSV_COLUMNS")
+convert = getattr(fileconversion, "convert", None)
+convert_and_load = getattr(fileconversion, "convert_and_load", None)
+convert_from_path = getattr(fileconversion, "convert_from_path", None)
+convert_from_upload = getattr(fileconversion, "convert_from_upload", None)
+record_to_xml = getattr(fileconversion, "record_to_xml", None)
+records_to_xml = getattr(fileconversion, "records_to_xml", None)
+CSV_COLUMNS = getattr(fileconversion, "CSV_COLUMNS", [])
 
 
-# Streamlit 1.40+ deprecation-free width parameter helper
+# ------------------------------------------------------------------------------
+# CONSTANTS & TAXONOMY MAPPINGS
+# ------------------------------------------------------------------------------
+
+FORMAT_MAPPINGS: Dict[str, Tuple[str, str, str]] = {
+    "CSV (.csv)": ("csv", "text/csv", ".csv"),
+    "JSON (.json)": ("json", "application/json", ".json"),
+    "JSON Lines (.jsonl)": ("jsonl", "application/x-ndjson", ".jsonl"),
+    "XML (.xml)": ("xml", "application/xml", ".xml"),
+}
+
+WINDOWS_EVENT_DESCRIPTIONS: Dict[str, str] = {
+    "4624": "Successful account logon",
+    "4625": "Failed account logon / Authentication failure",
+    "4634": "Account logoff",
+    "4648": "Logon attempted using explicit credentials",
+    "4672": "Special privileges assigned to new logon",
+    "4688": "New process creation",
+    "4689": "Process exit / termination",
+    "4720": "User account created",
+    "4724": "Password reset attempted",
+    "4740": "User account locked out",
+    "1102": "Audit log cleared",
+    "7036": "Service state change (started/stopped)",
+    "7040": "Service start type changed",
+    "7045": "New Windows service installed",
+    "6008": "Unexpected dirty shutdown",
+    "1000": "Application crash / faulting module error",
+    "10016": "DCOM permission error",
+    "7": "Disk bad block / I/O device error",
+    "5": "Disk block warning",
+    "16": "Filesystem data integrity verification warning",
+    "12": "Operating system kernel startup time",
+    "13": "Operating system kernel shutdown",
+    "41": "System rebooted without cleanly shutting down",
+}
+
+CUSTOM_CSS: str = """
+/* ========================================================================= */
+/* PRODUCTION-GRADE FORENSIC DESIGN SYSTEM & TYPOGRAPHY                      */
+/* ========================================================================= */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+/* Base Typography & Antialiasing */
+html, body, [class*="css"], .stApp {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+    color: #1E293B;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+    color: #0F172A !important;
+    font-weight: 700 !important;
+    letter-spacing: -0.02em !important;
+}
+
+h1 {
+    font-size: 1.65rem !important;
+    margin-bottom: 0.5rem !important;
+}
+
+h2 {
+    font-size: 1.30rem !important;
+    margin-top: 1rem !important;
+    margin-bottom: 0.4rem !important;
+}
+
+h3 {
+    font-size: 1.10rem !important;
+}
+
+h4, h5 {
+    font-size: 0.95rem !important;
+}
+
+/* Metric Card Styling */
+div[data-testid="metric-container"] {
+    background-color: #FFFFFF !important;
+    border: 1px solid #E2E8F0 !important;
+    border-top: 3px solid #2563EB !important;
+    padding: 12px 16px !important;
+    border-radius: 8px !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
+    transition: transform 0.15s ease, box-shadow 0.15s ease !important;
+}
+div[data-testid="metric-container"]:hover {
+    border-color: #CBD5E1 !important;
+    border-top-color: #1D4ED8 !important;
+    box-shadow: 0 4px 12px rgba(37, 99, 235, 0.10) !important;
+}
+div[data-testid="metric-container"] label {
+    color: #64748B !important;
+    font-weight: 600 !important;
+    font-size: 0.72rem !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.05em !important;
+}
+div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
+    color: #0F172A !important;
+    font-size: 1.40rem !important;
+    font-weight: 800 !important;
+    letter-spacing: -0.02em !important;
+}
+div[data-testid="metric-container"] div[data-testid="stMetricDelta"] {
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+}
+
+/* Primary Action Buttons - Enforce Crisp White Text on Blue */
+button[kind="primary"],
+div[data-testid="stButton"] > button[kind="primary"],
+.stButton > button[type="primary"],
+button[data-testid="baseButton-primary"] {
+    background-color: #2563EB !important;
+    border: 1px solid #1D4ED8 !important;
+    color: #FFFFFF !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05) !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+    font-size: 0.8125rem !important;
+    padding: 6px 14px !important;
+    transition: background-color 0.15s ease, border-color 0.15s ease !important;
+}
+button[kind="primary"] *,
+div[data-testid="stButton"] > button[kind="primary"] *,
+.stButton > button[type="primary"] *,
+button[data-testid="baseButton-primary"] *,
+button[kind="primary"] p,
+div[data-testid="stButton"] > button[kind="primary"] p,
+.stButton > button[type="primary"] p,
+button[data-testid="baseButton-primary"] p {
+    color: #FFFFFF !important;
+    fill: #FFFFFF !important;
+}
+button[kind="primary"]:hover,
+div[data-testid="stButton"] > button[kind="primary"]:hover,
+.stButton > button[type="primary"]:hover,
+button[data-testid="baseButton-primary"]:hover {
+    background-color: #1D4ED8 !important;
+    border-color: #1E40AF !important;
+    color: #FFFFFF !important;
+    box-shadow: 0 2px 8px rgba(37, 99, 235, 0.25) !important;
+}
+button[kind="primary"]:hover *,
+div[data-testid="stButton"] > button[kind="primary"]:hover *,
+.stButton > button[type="primary"]:hover *,
+button[data-testid="baseButton-primary"]:hover * {
+    color: #FFFFFF !important;
+    fill: #FFFFFF !important;
+}
+
+/* Secondary & Toolbar Buttons */
+.stButton > button {
+    border-radius: 6px !important;
+    font-size: 0.8125rem !important;
+    border: 1px solid #CBD5E1 !important;
+    color: #334155 !important;
+    background-color: #FFFFFF !important;
+    font-weight: 600 !important;
+    padding: 6px 14px !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03) !important;
+    transition: all 0.15s ease-in-out !important;
+}
+.stButton > button:not([kind="primary"]):not([type="primary"]):not([data-testid="baseButton-primary"]) * {
+    color: #334155 !important;
+}
+.stButton > button:hover {
+    border-color: #94A3B8 !important;
+    color: #0F172A !important;
+    background-color: #F8FAFC !important;
+}
+.stButton > button:not([kind="primary"]):not([type="primary"]):not([data-testid="baseButton-primary"]):hover * {
+    color: #0F172A !important;
+}
+
+/* Download Toolbar Buttons */
+.stDownloadButton > button {
+    border: 1px solid #CBD5E1 !important;
+    color: #2563EB !important;
+    background-color: #FFFFFF !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+    font-size: 0.8125rem !important;
+    padding: 6px 14px !important;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03) !important;
+    transition: all 0.15s ease-in-out !important;
+}
+.stDownloadButton > button * {
+    color: #2563EB !important;
+}
+.stDownloadButton > button:hover {
+    background-color: #EFF6FF !important;
+    border-color: #93C5FD !important;
+    color: #1D4ED8 !important;
+}
+.stDownloadButton > button:hover * {
+    color: #1D4ED8 !important;
+}
+
+/* Form Inputs Focus & Styling */
+input:focus, textarea:focus, div[data-baseweb="input"]:focus-within, div[data-baseweb="select"]:focus-within {
+    border-color: #2563EB !important;
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15) !important;
+}
+
+/* Sidebar Navigation Radios */
+section[data-testid="stSidebar"] {
+    background-color: #F8FAFC !important;
+    border-right: 1px solid #E2E8F0 !important;
+}
+section[data-testid="stSidebar"] .stRadio > div[role="radiogroup"] > label {
+    padding: 8px 12px !important;
+    border-radius: 8px !important;
+    transition: all 0.15s ease-in-out !important;
+    margin-bottom: 4px !important;
+    border: 1px solid transparent !important;
+    font-size: 0.85rem !important;
+    font-weight: 500 !important;
+}
+section[data-testid="stSidebar"] .stRadio > div[role="radiogroup"] > label:hover {
+    background-color: #EDF5FD !important;
+    border-color: #BAE6FD !important;
+}
+section[data-testid="stSidebar"] .stRadio > div[role="radiogroup"] > label:has(input:checked) {
+    background-color: #EFF6FF !important;
+    border-color: #93C5FD !important;
+    font-weight: 600 !important;
+    color: #1D4ED8 !important;
+}
+
+/* ============================================================= */
+/* FORENSIC GRID: EXACT PRODUCTION ALIGNMENT & TYPOGRAPHY       */
+/* ============================================================= */
+
+/* 1. Header Bar: Unified Dark Slate Container */
+div[data-testid="stHorizontalBlock"]:has(.th-cell) {
+    background: #0F172A !important;
+    border: 1px solid #0F172A !important;
+    border-radius: 8px 8px 0 0 !important;
+    padding: 0 10px !important;
+    min-height: 38px !important;
+    align-items: center !important;
+    margin-top: 8px !important;
+    margin-bottom: 0 !important;
+}
+
+div[data-testid="stHorizontalBlock"]:has(.th-cell) > div[data-testid="column"] {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+    min-height: 38px !important;
+    height: 100% !important;
+}
+
+div[data-testid="stHorizontalBlock"]:has(.th-cell) > div[data-testid="column"]:last-child {
+    justify-content: center !important;
+}
+
+div[data-testid="stHorizontalBlock"]:has(.th-cell) div[data-testid="element-container"] {
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+}
+
+div[data-testid="stHorizontalBlock"]:has(.th-cell) div[data-testid="stMarkdownContainer"] p {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.3 !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
+.th-cell {
+    color: #F8FAFC !important;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+    font-size: 0.72rem !important;
+    font-weight: 700 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.06em !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    display: flex !important;
+    align-items: center !important;
+    width: 100% !important;
+}
+
+/* 2. Data Rows: Crisp High-Contrast Centered Layout */
+div[data-testid="stHorizontalBlock"]:has(.cell-mono, .cell-text, .cell-time) {
+    background-color: #FFFFFF !important;
+    border-bottom: 1px solid #F1F5F9 !important;
+    border-left: 1px solid #E2E8F0 !important;
+    border-right: 1px solid #E2E8F0 !important;
+    padding: 0 10px !important;
+    min-height: 42px !important;
+    align-items: center !important;
+    transition: background-color 0.15s ease !important;
+}
+div[data-testid="stHorizontalBlock"]:has(.cell-mono, .cell-text, .cell-time):hover {
+    background-color: #F8FAFC !important;
+}
+
+div[data-testid="stHorizontalBlock"]:has(.cell-mono, .cell-text, .cell-time) > div[data-testid="column"] {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+    min-height: 42px !important;
+    height: 100% !important;
+}
+
+div[data-testid="stHorizontalBlock"]:has(.cell-mono, .cell-text, .cell-time) > div[data-testid="column"]:last-child {
+    justify-content: center !important;
+}
+
+div[data-testid="stHorizontalBlock"]:has(.cell-mono, .cell-text, .cell-time) div[data-testid="element-container"] {
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+    display: flex !important;
+    align-items: center !important;
+}
+
+div[data-testid="stHorizontalBlock"]:has(.cell-mono, .cell-text, .cell-time) div[data-testid="stMarkdownContainer"] {
+    width: 100% !important;
+}
+
+div[data-testid="stHorizontalBlock"]:has(.cell-mono, .cell-text, .cell-time) div[data-testid="stMarkdownContainer"] p {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.5 !important;
+    display: flex !important;
+    align-items: center !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+}
+
+/* Compact Details / Close Action Button in Grid */
+div[data-testid="stHorizontalBlock"]:has(.cell-mono, .cell-text, .cell-time) div[data-testid="stButton"] {
+    width: 100% !important;
+    margin: 0 !important;
+}
+div[data-testid="stHorizontalBlock"]:has(.cell-mono, .cell-text, .cell-time) div[data-testid="stButton"] button {
+    height: 26px !important;
+    min-height: 26px !important;
+    max-height: 26px !important;
+    line-height: 24px !important;
+    font-size: 0.75rem !important;
+    font-weight: 600 !important;
+    padding: 0 8px !important;
+    margin: 0 !important;
+    border-radius: 4px !important;
+    width: 100% !important;
+}
+div[data-testid="stHorizontalBlock"]:has(.cell-mono, .cell-text, .cell-time) div[data-testid="stButton"] button[kind="primary"] {
+    background-color: #0F172A !important;
+    border-color: #0F172A !important;
+    color: #FFFFFF !important;
+}
+div[data-testid="stHorizontalBlock"]:has(.cell-mono, .cell-text, .cell-time) div[data-testid="stButton"] button[kind="primary"] * {
+    color: #FFFFFF !important;
+    fill: #FFFFFF !important;
+}
+
+/* Data Cell Typography */
+.cell-mono, .cell-time, .cell-text {
+    font-size: 0.8125rem !important;
+    display: inline-block !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    width: 100% !important;
+    vertical-align: middle !important;
+}
+.cell-mono {
+    font-family: 'JetBrains Mono', 'SF Mono', Consolas, Menlo, monospace !important;
+    font-weight: 600 !important;
+    color: #0F172A !important;
+}
+.cell-time {
+    font-family: 'JetBrains Mono', 'SF Mono', Consolas, Menlo, monospace !important;
+    font-weight: 500 !important;
+    color: #334155 !important;
+}
+.cell-text {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+    font-weight: 500 !important;
+    color: #1E293B !important;
+}
+
+/* SEVERITY PILL BADGES */
+.badge-error, .badge-critical, .badge-warning, .badge-info, .badge-verbose {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+    font-size: 0.72rem !important;
+    font-weight: 600 !important;
+    padding: 2px 8px !important;
+    border-radius: 12px !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    line-height: 1.3 !important;
+    letter-spacing: 0.02em !important;
+    text-transform: capitalize !important;
+}
+.badge-error {
+    background-color: #FEF2F2 !important;
+    color: #DC2626 !important;
+    border: 1px solid #FECACA !important;
+}
+.badge-critical {
+    background-color: #FEF2F2 !important;
+    color: #991B1B !important;
+    border: 1px solid #F87171 !important;
+    font-weight: 700 !important;
+}
+.badge-warning {
+    background-color: #FFFBEB !important;
+    color: #D97706 !important;
+    border: 1px solid #FDE68A !important;
+}
+.badge-info {
+    background-color: #F0F9FF !important;
+    color: #0284C7 !important;
+    border: 1px solid #BAE6FD !important;
+}
+.badge-verbose {
+    background-color: #F8FAFC !important;
+    color: #64748B !important;
+    border: 1px solid #E2E8F0 !important;
+}
+
+/* CORRELATION CONFIDENCE PILL BADGES */
+.badge-corr-high, .badge-corr-med, .badge-corr-low, .badge-corr-anchor {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+    font-size: 0.72rem !important;
+    font-weight: 600 !important;
+    padding: 2px 8px !important;
+    border-radius: 12px !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    line-height: 1.3 !important;
+}
+.badge-corr-high {
+    background-color: #F0FDF4 !important;
+    color: #16A34A !important;
+    border: 1px solid #BBF7D0 !important;
+}
+.badge-corr-med {
+    background-color: #FFFBEB !important;
+    color: #D97706 !important;
+    border: 1px solid #FDE68A !important;
+}
+.badge-corr-low {
+    background-color: #F8FAFC !important;
+    color: #64748B !important;
+    border: 1px solid #E2E8F0 !important;
+}
+.badge-corr-anchor {
+    background-color: #EFF6FF !important;
+    color: #2563EB !important;
+    border: 1px solid #BFDBFE !important;
+    font-weight: 700 !important;
+}
+
+/* INLINE ROW EXPANSION: EVENT DATA DRAWER */
+.forensic-drawer {
+    background-color: #FFFFFF !important;
+    border: 1px solid #CBD5E1 !important;
+    border-left: 4px solid #2563EB !important;
+    border-radius: 8px !important;
+    padding: 16px 20px !important;
+    margin: 8px 0 16px 0 !important;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05) !important;
+}
+.forensic-drawer-title {
+    font-size: 0.75rem !important;
+    font-weight: 800 !important;
+    letter-spacing: 0.08em !important;
+    color: #0F172A !important;
+    text-transform: uppercase !important;
+    margin-bottom: 10px !important;
+}
+.forensic-payload-box {
+    background-color: #0F172A !important;
+    border: 1px solid #334155 !important;
+    border-radius: 6px !important;
+    padding: 14px 18px !important;
+    font-family: 'JetBrains Mono', 'SF Mono', Consolas, Menlo, monospace !important;
+    font-size: 0.8125rem !important;
+    color: #F8FAFC !important;
+    line-height: 1.65 !important;
+    margin-bottom: 12px !important;
+    word-break: break-word !important;
+    max-height: 280px !important;
+    overflow-y: auto !important;
+    white-space: pre-wrap !important;
+}
+.forensic-payload-box,
+.forensic-payload-box *,
+.forensic-payload-box p,
+.forensic-payload-box span,
+.forensic-payload-box div,
+.forensic-payload-box pre,
+.forensic-payload-box code,
+.forensic-payload-box strong,
+.forensic-payload-box em {
+    color: #F8FAFC !important;
+    font-family: 'JetBrains Mono', 'SF Mono', Consolas, Menlo, monospace !important;
+}
+.forensic-payload-key {
+    color: #38BDF8 !important;
+    font-weight: 700 !important;
+    margin-right: 8px !important;
+}
+.forensic-payload-val {
+    color: #F8FAFC !important;
+}
+
+/* Filter indicator pill */
+.filter-indicator-pill {
+    background-color: #EFF6FF !important;
+    border: 1px solid #BFDBFE !important;
+    border-radius: 14px !important;
+    padding: 2px 10px !important;
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+    color: #2563EB !important;
+    display: inline-block !important;
+}
+
+/* CHATGPT-STYLE AI ASSISTANT CONVERSATIONAL UI */
+div[data-testid="stChatMessage"] {
+    border-radius: 12px !important;
+    padding: 16px 20px !important;
+    margin-bottom: 16px !important;
+    border: 1px solid #E2E8F0 !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
+    transition: border-color 0.15s ease !important;
+}
+div[data-testid="stChatMessage"]:hover {
+    border-color: #CBD5E1 !important;
+}
+div[data-testid="stChatMessage"][data-testid*="user"] {
+    background-color: #F8FAFC !important;
+    border: 1px solid #E2E8F0 !important;
+}
+div[data-testid="stChatMessage"][data-testid*="assistant"] {
+    background-color: #FFFFFF !important;
+    border-left: 4px solid #2563EB !important;
+}
+div[data-testid="stChatInput"] {
+    border-radius: 10px !important;
+    border: 1px solid #CBD5E1 !important;
+}
+div[data-testid="stChatInput"]:focus-within {
+    border-color: #2563EB !important;
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15) !important;
+}
+
+/* Markdown Tables in Chat Responses */
+div[data-testid="stChatMessage"] table {
+    width: 100% !important;
+    border-collapse: collapse !important;
+    margin: 12px 0 !important;
+    font-size: 0.8125rem !important;
+    border: 1px solid #E2E8F0 !important;
+    border-radius: 6px !important;
+    overflow: hidden !important;
+}
+div[data-testid="stChatMessage"] th {
+    background-color: #F1F5F9 !important;
+    color: #0F172A !important;
+    font-weight: 700 !important;
+    padding: 8px 12px !important;
+    border-bottom: 2px solid #E2E8F0 !important;
+    text-align: left !important;
+    font-size: 0.78rem !important;
+}
+div[data-testid="stChatMessage"] td {
+    padding: 8px 12px !important;
+    border-bottom: 1px solid #F1F5F9 !important;
+    color: #334155 !important;
+    vertical-align: middle !important;
+}
+div[data-testid="stChatMessage"] tr:last-child td {
+    border-bottom: none !important;
+}
+"""
+
+
+# ------------------------------------------------------------------------------
+# CORE UTILITY & EXTRACTION HELPERS
+# ------------------------------------------------------------------------------
+
 def stretch_kw() -> Dict[str, Any]:
     """Returns width='stretch' if supported by current Streamlit, else use_container_width=True."""
     sig = inspect.signature(st.button)
@@ -63,6 +679,7 @@ def stretch_kw() -> Dict[str, Any]:
 
 
 def normalize_path(p: Optional[str]) -> str:
+    """Normalizes, expands environment variables and user paths cleanly."""
     if hasattr(fileconversion, "normalize_path"):
         return fileconversion.normalize_path(p)
     if not p:
@@ -70,20 +687,19 @@ def normalize_path(p: Optional[str]) -> str:
     return os.path.abspath(os.path.expandvars(os.path.expanduser(str(p).strip().strip("'\""))))
 
 
-def find_source_files(src: str, selected_files: Optional[List[str]] = None, recursive: bool = False) -> List[str]:
+def find_source_files(
+    src: str, selected_files: Optional[List[str]] = None, recursive: bool = False
+) -> List[str]:
+    """Discovers matching .evtx files from filesystem path, folder, or wildcard."""
     if hasattr(fileconversion, "find_source_files"):
         return fileconversion.find_source_files(src, selected_files=selected_files, recursive=recursive)
     norm = normalize_path(src)
     if os.path.isfile(norm):
-        return [norm]
+        return [norm] if norm.lower().endswith(".evtx") else []
     if os.path.isdir(norm):
         return [os.path.join(norm, f) for f in os.listdir(norm) if f.lower().endswith(".evtx")]
     return glob.glob(norm, recursive=recursive)
 
-
-# ------------------------------------------------------------------------------
-# FORMATTING & EXTRACTION HELPERS
-# ------------------------------------------------------------------------------
 
 def format_time_utc(ts_str: Any) -> str:
     """Formats ISO-8601 timestamp string to standard 'M/D/YY, H:MM:SS AM/PM'."""
@@ -112,8 +728,8 @@ def unpack_event_data_dict(ed_raw: Any) -> Dict[str, Any]:
     try:
         parsed = json.loads(s)
         if isinstance(parsed, dict):
-            clean = {}
-            for idx, (k, v) in enumerate(parsed.items(), 1):
+            clean: Dict[str, Any] = {}
+            for k, v in parsed.items():
                 if isinstance(v, dict) and "Value" in v:
                     clean[k] = v["Value"]
                 else:
@@ -127,7 +743,7 @@ def unpack_event_data_dict(ed_raw: Any) -> Dict[str, Any]:
 
 
 def compute_event_summary(row: Any) -> str:
-    """Computes a concise, single-line summary string for the Forensic Grid (e.g. Data1=Category: ...)."""
+    """Computes a concise, single-line summary string for the Forensic Grid."""
     # 1. EventData parsing
     ed_raw = str(row.get("EventData", "")).strip()
     if ed_raw and ed_raw.lower() not in ("", "none", "nan", "null", "{}"):
@@ -354,482 +970,33 @@ def analyze_forensic_query(
 
 
 # ------------------------------------------------------------------------------
-# STREAMLIT CONFIGURATION & STYLING (HIGH CONTRAST & PERFECT ALIGNMENT)
+# STAGE 3 FORENSIC CACHED ENGINES & DUCKDB INGESTION
 # ------------------------------------------------------------------------------
-
-st.set_page_config(
-    page_title="Windows EVTX Forensic Log Converter & Inspector",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.markdown(
-    """
-    <style>
-    /* ========================================================================= */
-    /* STANDARD BLUE FORENSIC THEME & HIGH-CONTRAST TYPOGRAPHY                  */
-    /* ========================================================================= */
-
-    /* Typography & Contrast */
-    html, body, [class*="css"] {
-        color: #1E293B;
-    }
-    h1, h2, h3, h4, h5, h6 {
-        color: #0F172A !important;
-        font-weight: 700 !important;
-        letter-spacing: -0.01em !important;
-    }
-    p, span, label, div {
-        color: #1E293B;
-    }
-
-    /* Metric Card Styling */
-    div[data-testid="metric-container"] {
-        background-color: #FFFFFF;
-        border: 1px solid #CBD5E1;
-        border-top: 3px solid #1E88E5;
-        padding: 12px 18px;
-        border-radius: 8px;
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
-        transition: all 0.2s ease-in-out;
-    }
-    div[data-testid="metric-container"]:hover {
-        border-color: #1E88E5;
-        box-shadow: 0 4px 12px rgba(30, 136, 229, 0.15);
-    }
-    div[data-testid="metric-container"] label {
-        color: #475569 !important;
-        font-weight: 700 !important;
-        font-size: 0.80rem !important;
-        text-transform: uppercase !important;
-        letter-spacing: 0.04em !important;
-    }
-    div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
-        color: #0F172A !important;
-        font-weight: 800 !important;
-    }
-
-    /* Primary Buttons -> Standard Blue */
-    button[kind="primary"],
-    div[data-testid="stButton"] > button[kind="primary"],
-    .stButton > button[type="primary"],
-    button[data-testid="baseButton-primary"] {
-        background-color: #1E88E5 !important;
-        border-color: #1976D2 !important;
-        color: #FFFFFF !important;
-        box-shadow: 0 2px 8px rgba(30, 136, 229, 0.25) !important;
-        border-radius: 6px !important;
-        font-weight: 700 !important;
-    }
-    button[kind="primary"]:hover,
-    div[data-testid="stButton"] > button[kind="primary"]:hover,
-    .stButton > button[type="primary"]:hover {
-        background-color: #1976D2 !important;
-        border-color: #1565C0 !important;
-        color: #FFFFFF !important;
-        box-shadow: 0 4px 14px rgba(30, 136, 229, 0.35) !important;
-    }
-
-    /* Secondary / Action Buttons */
-    .stButton > button {
-        border-radius: 6px !important;
-        font-size: 0.85rem !important;
-        border: 1px solid #CBD5E1 !important;
-        color: #1E293B !important;
-        background-color: #FFFFFF !important;
-        font-weight: 600 !important;
-        transition: all 0.15s ease-in-out;
-    }
-    .stButton > button:hover {
-        border-color: #1E88E5 !important;
-        color: #1E88E5 !important;
-        background-color: #F0F7FF !important;
-    }
-
-    /* Download Buttons */
-    .stDownloadButton > button {
-        border: 1px solid #1E88E5 !important;
-        color: #1E88E5 !important;
-        background-color: #FFFFFF !important;
-        border-radius: 6px !important;
-        font-weight: 700 !important;
-    }
-    .stDownloadButton > button:hover {
-        background-color: #1E88E5 !important;
-        border-color: #1565C0 !important;
-        color: #FFFFFF !important;
-    }
-
-    /* Inputs focus */
-    input:focus, textarea:focus, div[data-baseweb="input"]:focus-within, div[data-baseweb="select"]:focus-within {
-        border-color: #1E88E5 !important;
-        box-shadow: 0 0 0 1px #1E88E5 !important;
-    }
-
-    /* Sidebar Navigation Radios */
-    section[data-testid="stSidebar"] {
-        background-color: #F8FAFC !important;
-        border-right: 1px solid #E2E8F0 !important;
-    }
-    section[data-testid="stSidebar"] .stRadio > div[role="radiogroup"] > label {
-        padding: 8px 12px !important;
-        border-radius: 8px !important;
-        transition: all 0.15s ease-in-out !important;
-        margin-bottom: 4px !important;
-        border: 1px solid transparent !important;
-    }
-    section[data-testid="stSidebar"] .stRadio > div[role="radiogroup"] > label:hover {
-        background-color: #EDF5FD !important;
-        border-color: #BAE6FD !important;
-    }
-    section[data-testid="stSidebar"] .stRadio > div[role="radiogroup"] > label:has(input:checked) {
-        background-color: #E0F2FE !important;
-        border-color: #38BDF8 !important;
-        font-weight: 700 !important;
-        color: #0369A1 !important;
-    }
-
-    /* ------------------------------------------------------------- */
-    /* FORENSIC GRID ROW & HEADER ALIGNMENT                          */
-    /* ------------------------------------------------------------- */
-
-    /* Ensure every horizontal block is vertically centered */
-    div[data-testid="stHorizontalBlock"] {
-        align-items: center !important;
-        border-bottom: 1px solid #E2E8F0 !important;
-        padding-top: 2px !important;
-        padding-bottom: 2px !important;
-    }
-
-    /* Remove paragraph margins causing vertical displacement */
-    div[data-testid="stHorizontalBlock"] div[data-testid="stMarkdownContainer"] p {
-        margin: 0 !important;
-        padding: 0 !important;
-        line-height: 28px !important;
-        white-space: nowrap !important;
-        overflow: hidden !important;
-        text-overflow: ellipsis !important;
-    }
-
-    /* Grid Table Header Cells */
-    .th-cell {
-        background-color: #1E3A8A !important;
-        color: #FFFFFF !important;
-        font-size: 0.76rem !important;
-        font-weight: 800 !important;
-        text-transform: uppercase !important;
-        letter-spacing: 0.05em !important;
-        padding: 7px 6px !important;
-        border-radius: 4px !important;
-        border-bottom: 2px solid #1E88E5 !important;
-        white-space: nowrap !important;
-        overflow: hidden !important;
-        text-overflow: ellipsis !important;
-        line-height: 1.2 !important;
-        display: block !important;
-    }
-
-    /* Action button column: exact centering and compact 26px height */
-    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child {
-        display: flex !important;
-        align-items: center !important;
-        justify-content: center !important;
-    }
-    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child div[data-testid="stButton"] {
-        width: 100% !important;
-        margin: 0 !important;
-    }
-    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child div[data-testid="stButton"] button {
-        height: 26px !important;
-        min-height: 26px !important;
-        max-height: 26px !important;
-        line-height: 24px !important;
-        padding: 0 6px !important;
-        font-size: 0.76rem !important;
-        font-weight: 700 !important;
-        margin: 0 !important;
-        border-radius: 4px !important;
-        width: 100% !important;
-    }
-
-    /* HIGH-CONTRAST CELL TYPOGRAPHY */
-    .cell-mono {
-        font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace !important;
-        font-size: 0.82rem !important;
-        font-weight: 700 !important;
-        color: #0F172A !important;
-        white-space: nowrap !important;
-        overflow: hidden !important;
-        text-overflow: ellipsis !important;
-        display: block !important;
-    }
-    .cell-time {
-        font-family: 'JetBrains Mono', Consolas, monospace !important;
-        font-size: 0.80rem !important;
-        color: #1E293B !important;
-        white-space: nowrap !important;
-        overflow: hidden !important;
-        text-overflow: ellipsis !important;
-        display: block !important;
-    }
-    .cell-text {
-        font-size: 0.82rem !important;
-        color: #0F172A !important;
-        white-space: nowrap !important;
-        overflow: hidden !important;
-        text-overflow: ellipsis !important;
-        display: block !important;
-    }
-
-    /* SEVERITY PILL BADGES */
-    .badge-error {
-        background-color: #FEE2E2 !important;
-        color: #DC2626 !important;
-        border: 1px solid #FCA5A5 !important;
-        border-radius: 10px !important;
-        padding: 1px 7px !important;
-        font-size: 0.76rem !important;
-        font-weight: 700 !important;
-        display: inline-block !important;
-        line-height: 1.4 !important;
-    }
-    .badge-critical {
-        background-color: #FEE2E2 !important;
-        color: #991B1B !important;
-        border: 1px solid #F87171 !important;
-        border-radius: 10px !important;
-        padding: 1px 7px !important;
-        font-weight: 800 !important;
-        font-size: 0.76rem !important;
-        display: inline-block !important;
-        line-height: 1.4 !important;
-    }
-    .badge-warning {
-        background-color: #FEF3C7 !important;
-        color: #B45309 !important;
-        border: 1px solid #FCD34D !important;
-        border-radius: 10px !important;
-        padding: 1px 7px !important;
-        font-size: 0.76rem !important;
-        font-weight: 700 !important;
-        display: inline-block !important;
-        line-height: 1.4 !important;
-    }
-    .badge-info {
-        background-color: #E0F2FE !important;
-        color: #0369A1 !important;
-        border: 1px solid #BAE6FD !important;
-        border-radius: 10px !important;
-        padding: 1px 7px !important;
-        font-size: 0.76rem !important;
-        font-weight: 600 !important;
-        display: inline-block !important;
-        line-height: 1.4 !important;
-    }
-    .badge-verbose {
-        background-color: #F1F5F9 !important;
-        color: #475569 !important;
-        border: 1px solid #CBD5E1 !important;
-        border-radius: 10px !important;
-        padding: 1px 7px !important;
-        font-size: 0.76rem !important;
-        display: inline-block !important;
-        line-height: 1.4 !important;
-    }
-
-    /* CORRELATION CONFIDENCE PILL BADGES */
-    .badge-corr-high {
-        background-color: #DCFCE7 !important;
-        color: #15803D !important;
-        border: 1px solid #86EFAC !important;
-        border-radius: 10px !important;
-        padding: 1px 7px !important;
-        font-size: 0.76rem !important;
-        font-weight: 700 !important;
-        display: inline-block !important;
-        line-height: 1.4 !important;
-    }
-    .badge-corr-med {
-        background-color: #FEF3C7 !important;
-        color: #B45309 !important;
-        border: 1px solid #FCD34D !important;
-        border-radius: 10px !important;
-        padding: 1px 7px !important;
-        font-size: 0.76rem !important;
-        font-weight: 700 !important;
-        display: inline-block !important;
-        line-height: 1.4 !important;
-    }
-    .badge-corr-low {
-        background-color: #F1F5F9 !important;
-        color: #475569 !important;
-        border: 1px solid #CBD5E1 !important;
-        border-radius: 10px !important;
-        padding: 1px 7px !important;
-        font-size: 0.76rem !important;
-        font-weight: 600 !important;
-        display: inline-block !important;
-        line-height: 1.4 !important;
-    }
-    .badge-corr-anchor {
-        background-color: #DBEAFE !important;
-        color: #1D4ED8 !important;
-        border: 1px solid #93C5FD !important;
-        border-radius: 10px !important;
-        padding: 1px 7px !important;
-        font-size: 0.76rem !important;
-        font-weight: 800 !important;
-        display: inline-block !important;
-        line-height: 1.4 !important;
-    }
-
-    /* INLINE ROW EXPANSION: EVENT DATA DRAWER */
-    .forensic-drawer {
-        background-color: #FFFFFF;
-        border: 1px solid #CBD5E1;
-        border-left: 4px solid #1E88E5;
-        border-radius: 8px;
-        padding: 16px 20px;
-        margin: 6px 0 14px 0;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.06);
-    }
-    .forensic-drawer-title {
-        font-size: 0.78rem;
-        font-weight: 800;
-        letter-spacing: 0.08em;
-        color: #0F172A;
-        text-transform: uppercase;
-        margin-bottom: 8px;
-    }
-    .forensic-payload-box {
-        background-color: #0F172A !important;
-        border: 1px solid #1E293B !important;
-        border-radius: 6px !important;
-        padding: 14px 18px !important;
-        font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace !important;
-        font-size: 0.80rem !important;
-        color: #F8FAFC !important;
-        line-height: 1.6 !important;
-        margin-bottom: 12px !important;
-        word-break: break-word !important;
-        max-height: 280px !important;
-        overflow-y: auto !important;
-        white-space: pre-wrap !important;
-    }
-    .forensic-payload-key {
-        color: #38BDF8 !important;
-        font-weight: 700 !important;
-        margin-right: 10px !important;
-    }
-    .forensic-payload-val {
-        color: #F8FAFC !important;
-    }
-
-    /* Filter indicator pill */
-    .filter-indicator-pill {
-        background-color: rgba(30, 136, 229, 0.12);
-        border: 1px solid rgba(30, 136, 229, 0.35);
-        border-radius: 16px;
-        padding: 3px 12px;
-        font-size: 0.82rem;
-        font-weight: 700;
-        color: #1E88E5;
-        display: inline-block;
-    }
-
-    /* ------------------------------------------------------------- */
-    /* CHATGPT-STYLE AI ASSISTANT CONVERSATIONAL UI                  */
-    /* ------------------------------------------------------------- */
-    div[data-testid="stChatMessage"] {
-        border-radius: 12px !important;
-        padding: 16px 20px !important;
-        margin-bottom: 16px !important;
-        border: 1px solid #E2E8F0 !important;
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04) !important;
-        transition: all 0.2s ease-in-out !important;
-    }
-    div[data-testid="stChatMessage"]:hover {
-        border-color: rgba(30, 136, 229, 0.35) !important;
-    }
-    div[data-testid="stChatMessage"][data-testid*="user"] {
-        background-color: #F0F7FF !important;
-        border: 1px solid #BAE6FD !important;
-    }
-    div[data-testid="stChatMessage"][data-testid*="assistant"] {
-        background-color: #FFFFFF !important;
-        border-left: 4px solid #1E88E5 !important;
-    }
-    div[data-testid="stChatInput"] {
-        border-radius: 10px !important;
-        border: 1px solid #90CAF9 !important;
-    }
-    div[data-testid="stChatInput"]:focus-within {
-        border-color: #1E88E5 !important;
-        box-shadow: 0 0 0 2px rgba(30, 136, 229, 0.2) !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ------------------------------------------------------------------------------
-# SESSION STATE INITIALIZATION
-# ------------------------------------------------------------------------------
-
-if "active_tab" not in st.session_state:
-    st.session_state["active_tab"] = "converter"
-if "last_converted_file" not in st.session_state:
-    st.session_state["last_converted_file"] = None
-if "viewer_folder" not in st.session_state:
-    st.session_state["viewer_folder"] = "Converted files"
-if "expanded_record_id" not in st.session_state:
-    st.session_state["expanded_record_id"] = None
-if "raw_view_mode" not in st.session_state:
-    st.session_state["raw_view_mode"] = None
-if "grid_page" not in st.session_state:
-    st.session_state["grid_page"] = 1
-if "grid_page_size" not in st.session_state:
-    st.session_state["grid_page_size"] = 25
-if "grid_sort_asc" not in st.session_state:
-    st.session_state["grid_sort_asc"] = True
-if "chatbot_messages" not in st.session_state:
-    st.session_state["chatbot_messages"] = [
-        {
-            "role": "assistant",
-            "content": "👋 **Forensic AI Assistant online.** Ask questions to correlate security events, hunt threats, or inspect specific event IDs across your converted logs.",
-            "evidence": None,
-        }
-    ]
-
 
 @st.cache_data(show_spinner=False)
 def load_log_data(filepath: str) -> pd.DataFrame:
     """Loads and caches a CSV or JSON file as a pandas DataFrame."""
-    if not os.path.isfile(filepath):
+    norm_path = normalize_path(filepath)
+    if not os.path.isfile(norm_path):
         return pd.DataFrame()
     try:
-        lower_path = filepath.lower()
-        if lower_path.endswith(".json"):
-            df = pd.read_json(filepath, dtype=str)
-        elif lower_path.endswith(".jsonl"):
-            df = pd.read_json(filepath, lines=True, dtype=str)
+        if norm_path.lower().endswith(".csv"):
+            df = pd.read_csv(norm_path, dtype=str, keep_default_na=False)
+        elif norm_path.lower().endswith(".jsonl"):
+            df = pd.read_json(norm_path, lines=True, dtype=False)
+        elif norm_path.lower().endswith(".json"):
+            df = pd.read_json(norm_path, dtype=False)
         else:
-            df = pd.read_csv(filepath, dtype=str, keep_default_na=False)
+            df = pd.read_csv(norm_path, dtype=str, keep_default_na=False)
 
-        df.fillna("", inplace=True)
-        df.replace({"null": "", "None": "", "NULL": "", "NaN": "", "nan": ""}, inplace=True)
-        if "EventID" in df.columns:
-            df["EventID"] = df["EventID"].apply(clean_event_id_scalar)
+        for col in ("RecordID", "EventID"):
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.strip().str.replace(".0", "", regex=False)
         return df
     except Exception as e:
         st.error(f"Error loading log file: {e}")
         return pd.DataFrame()
 
-
-# ------------------------------------------------------------------------------
-# STAGE 3 FORENSIC CACHED ENGINES & DUCKDB SYNC
-# ------------------------------------------------------------------------------
 
 @st.cache_resource
 def get_duckdb_conn() -> duckdb.DuckDBPyConnection:
@@ -864,7 +1031,6 @@ def get_vector_index(_embedder: TemplateEmbedder) -> TemplateVectorIndex:
     try:
         return TemplateVectorIndex(embedder=_embedder, storage_path=storage_path)
     except Exception:
-        import tempfile
         tmp_dir = os.path.join(tempfile.gettempdir(), f"qdrant_local_{os.getpid()}")
         return TemplateVectorIndex(embedder=_embedder, storage_path=tmp_dir)
 
@@ -888,7 +1054,9 @@ def get_correlation_mgr() -> CorrelationIndexManager:
 
 
 @st.cache_resource
-def get_retrieval_pipeline(backend_type: str = "mock", model_name: str = "Qwen/Qwen2.5-7B-Instruct") -> ForensicRetrievalPipeline:
+def get_retrieval_pipeline(
+    backend_type: str = "mock", model_name: str = "Qwen/Qwen2.5-7B-Instruct"
+) -> ForensicRetrievalPipeline:
     """Provides the cached end-to-end retrieval and Qwen answer generation pipeline."""
     cfg = PipelineConfig(backend_type=backend_type, model_name=model_name)
     return ForensicRetrievalPipeline(config=cfg)
@@ -967,35 +1135,8 @@ def sync_dataframe_to_duckdb(
 
 
 # ------------------------------------------------------------------------------
-# WINDOWS EVENT TAXONOMY & CHATGPT-STYLE FORENSIC SYNTHESIZER
+# CHATGPT-STYLE FORENSIC RESPONSE SYNTHESIZER
 # ------------------------------------------------------------------------------
-
-WINDOWS_EVENT_DESCRIPTIONS: Dict[str, str] = {
-    "4624": "Successful account logon",
-    "4625": "Failed account logon / Authentication failure",
-    "4634": "Account logoff",
-    "4648": "Logon attempted using explicit credentials",
-    "4672": "Special privileges assigned to new logon",
-    "4688": "New process creation",
-    "4689": "Process exit / termination",
-    "4720": "User account created",
-    "4724": "Password reset attempted",
-    "4740": "User account locked out",
-    "1102": "Audit log cleared",
-    "7036": "Service state change (started/stopped)",
-    "7040": "Service start type changed",
-    "7045": "New Windows service installed",
-    "6008": "Unexpected dirty shutdown",
-    "1000": "Application crash / faulting module error",
-    "10016": "DCOM permission error",
-    "7": "Disk bad block / I/O device error",
-    "5": "Disk block warning",
-    "16": "Filesystem data integrity verification warning",
-    "12": "Operating system kernel startup time",
-    "13": "Operating system kernel shutdown",
-    "41": "System rebooted without cleanly shutting down",
-}
-
 
 def generate_chatgpt_forensic_response(
     query: str,
@@ -1181,7 +1322,7 @@ def generate_chatgpt_forensic_response(
     scope_pct = (match_cnt / total_scope_records * 100.0) if total_scope_records > 0 else 100.0
 
     lead_query = query.strip()
-    resp = f"### 🔍 Forensic Findings\n\n"
+    resp = "### 🔍 Forensic Findings\n\n"
 
     if qwen_answer:
         resp += f"#### 🤖 Qwen Cited Analysis\n\n{qwen_answer}\n\n"
@@ -1307,44 +1448,93 @@ def generate_chatgpt_forensic_response(
 
 
 # ------------------------------------------------------------------------------
-# SIDEBAR: NAVIGATION & CONTROLS
+# SESSION STATE & UI INITIALIZATION
 # ------------------------------------------------------------------------------
 
-st.sidebar.title("Windows Event Logs")
-st.sidebar.subheader("Navigation")
-
-tab_keys = ["converter", "viewer", "assistant"]
-tab_options = [
-    "🔄 Convert EVTX (Multi-Format)",
-    "📊 Forensic Grid & Inspector",
-    "🤖 Forensic Assistant",
-]
-key_to_idx = {k: i for i, k in enumerate(tab_keys)}
-
-curr_key = st.session_state.get("active_tab", "converter")
-if curr_key in ("chatbot", "templates"):
-    curr_key = "assistant"
-    st.session_state["active_tab"] = "assistant"
-curr_idx = key_to_idx.get(curr_key, 0)
-
-page_selection = st.sidebar.radio(
-    "Choose Mode:",
-    options=tab_options,
-    index=curr_idx,
-)
-sel_idx = tab_options.index(page_selection)
-st.session_state["active_tab"] = tab_keys[sel_idx]
-
-st.sidebar.markdown("---")
-st.sidebar.caption("⚡ **Engine:** `evtx_dump` + `python-evtx` fallback")
-st.sidebar.caption("📁 **Supported Formats:** CSV, JSON, JSONL, XML")
+def init_session_state() -> None:
+    """Initializes Streamlit session state keys with default values."""
+    defaults: Dict[str, Any] = {
+        "active_tab": "converter",
+        "last_converted_file": None,
+        "viewer_folder": "Converted files",
+        "expanded_record_id": None,
+        "raw_view_mode": None,
+        "grid_page": 1,
+        "grid_page_size": 25,
+        "grid_sort_asc": True,
+        "chatbot_messages": [
+            {
+                "role": "assistant",
+                "content": "👋 **Hello! I'm your Forensic AI Assistant.** Ask any question about your event logs in plain English to investigate alerts, hunt threats, or inspect specific system behaviors.",
+                "filter_card": None,
+                "templates": None,
+                "evidence": None,
+            }
+        ],
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
-# ==============================================================================
-# VIEW 1: CONVERTER (MULTI-FORMAT EXPORT)
-# ==============================================================================
+def inject_custom_styles() -> None:
+    """Configures page title and injects high-contrast forensic CSS."""
+    try:
+        st.set_page_config(
+            page_title="Windows EVTX Forensic Log Converter & Inspector",
+            layout="wide",
+            initial_sidebar_state="expanded",
+        )
+    except Exception:
+        pass
+    st.markdown(f"<style>{CUSTOM_CSS}</style>", unsafe_allow_html=True)
 
-if st.session_state["active_tab"] == "converter":
+
+# ------------------------------------------------------------------------------
+# SIDEBAR NAVIGATION
+# ------------------------------------------------------------------------------
+
+def render_sidebar() -> str:
+    """Renders the persistent sidebar and returns the selected active tab key."""
+    st.sidebar.title("Windows Event Logs")
+    st.sidebar.subheader("Navigation")
+
+    tab_keys = ["converter", "viewer", "assistant"]
+    tab_options = [
+        "🔄 Convert EVTX (Multi-Format)",
+        "📊 Forensic Grid & Inspector",
+        "🤖 Forensic Assistant",
+    ]
+    key_to_idx = {k: i for i, k in enumerate(tab_keys)}
+
+    curr_key = st.session_state.get("active_tab", "converter")
+    if curr_key in ("chatbot", "templates"):
+        curr_key = "assistant"
+        st.session_state["active_tab"] = "assistant"
+    curr_idx = key_to_idx.get(curr_key, 0)
+
+    page_selection = st.sidebar.radio(
+        "Choose Mode:",
+        options=tab_options,
+        index=curr_idx,
+    )
+    sel_idx = tab_options.index(page_selection)
+    selected_tab = tab_keys[sel_idx]
+    st.session_state["active_tab"] = selected_tab
+
+    st.sidebar.markdown("---")
+    st.sidebar.caption("⚡ **Engine:** `evtx_dump` + `python-evtx` fallback")
+    st.sidebar.caption("📁 **Supported Formats:** CSV, JSON, JSONL, XML")
+
+    return selected_tab
+
+
+# ------------------------------------------------------------------------------
+# VIEW 1: MULTI-FORMAT EVTX CONVERTER
+# ------------------------------------------------------------------------------
+
+def render_converter_view() -> None:
+    """Renders the EVTX multi-format conversion suite."""
     st.title("🔄 Windows EVTX Multi-Format Converter")
     st.markdown(
         "Convert Windows `.evtx` event logs to **CSV**, **JSON**, **JSON Lines (JSONL)**, or **XML** "
@@ -1361,21 +1551,13 @@ if st.session_state["active_tab"] == "converter":
     with col_fmt:
         export_fmt_label = st.selectbox(
             "Target Export Format:",
-            options=["CSV (.csv)", "JSON (.json)", "JSON Lines (.jsonl)", "XML (.xml)"],
+            options=list(FORMAT_MAPPINGS.keys()),
             index=0,
             help="Choose the file format to generate from the EVTX event logs.",
         )
-        fmt_map = {
-            "CSV (.csv)": ("csv", "text/csv", ".csv"),
-            "JSON (.json)": ("json", "application/json", ".json"),
-            "JSON Lines (.jsonl)": ("jsonl", "application/x-ndjson", ".jsonl"),
-            "XML (.xml)": ("xml", "application/xml", ".xml"),
-        }
-        output_format, mime_type, ext_suffix = fmt_map[export_fmt_label]
+        output_format, mime_type, ext_suffix = FORMAT_MAPPINGS[export_fmt_label]
 
-    # --------------------------------------------------------------------------
-    # OPTION A: BROWSER FILE UPLOAD
-    # --------------------------------------------------------------------------
+    # OPTION A: Browser Drag & Drop
     if convert_mode == "📂 Drag & Drop File Upload":
         st.subheader("Upload .evtx File(s)")
         uploaded_files = st.file_uploader(
@@ -1490,9 +1672,7 @@ if st.session_state["active_tab"] == "converter":
                         except Exception:
                             pass
 
-    # --------------------------------------------------------------------------
-    # OPTION B: SYSTEM PATH / FOLDER / WILDCARD
-    # --------------------------------------------------------------------------
+    # OPTION B: System Path / Folder / Wildcard
     else:
         st.subheader("Specify Source & Destination Paths")
         st.caption("Enter any file path, directory path, or wildcard pattern on your local filesystem.")
@@ -1504,10 +1684,7 @@ if st.session_state["active_tab"] == "converter":
                 value="Original Data/evtx" if os.path.isdir("Original Data/evtx") else "",
                 placeholder="e.g. sample.evtx, Original Data/evtx, or logs/*.evtx",
             )
-            recursive_check = st.checkbox(
-                "Recursively scan subdirectories",
-                value=False,
-            )
+            recursive_check = st.checkbox("Recursively scan subdirectories", value=False)
 
         with col_dst:
             dest_input = st.text_input(
@@ -1540,7 +1717,7 @@ if st.session_state["active_tab"] == "converter":
 
                 start_time = time.time()
                 try:
-                    def update_progress(current, total, filename, count):
+                    def update_progress(current: int, total: int, filename: str, count: int) -> None:
                         pct = current / total if total > 0 else 1.0
                         progress_bar.progress(pct)
                         status_text.markdown(f"Converting: **{filename}** ({current}/{total}) -> **{count:,}** records")
@@ -1593,18 +1770,19 @@ if st.session_state["active_tab"] == "converter":
                     st.error(f"Conversion failed: {exc}")
 
 
-# ==============================================================================
-# VIEW 2: LOG VIEWER & FORENSIC GRID INSPECTOR
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# VIEW 2: FORENSIC LOG INSPECTOR & GRID
+# ------------------------------------------------------------------------------
 
-elif st.session_state["active_tab"] == "viewer":
+def render_viewer_view() -> None:
+    """Renders the forensic log inspector, advanced filter accordion, and paginated grid."""
     st.title("📊 Forensic Log Inspector & Grid")
     st.markdown("Interactive Windows Event Log viewer featuring the exact forensic grid, advanced filters, and inline event drawers.")
 
     log_dir = st.session_state.get("viewer_folder", "Converted files")
     norm_log_dir = normalize_path(log_dir)
 
-    available_files = []
+    available_files: List[str] = []
     if os.path.isdir(norm_log_dir):
         for ext in ("*.csv", "*.json", "*.jsonl"):
             available_files.extend(glob.glob(os.path.join(norm_log_dir, ext)))
@@ -1642,505 +1820,470 @@ elif st.session_state["active_tab"] == "viewer":
         st.warning(f"No converted log files found inside `{log_dir}`. Convert an `.evtx` file in the Converter tab first.")
         selected_log_path = None
 
-    if selected_log_path and os.path.isfile(selected_log_path):
-        df = load_log_data(selected_log_path)
+    if not selected_log_path or not os.path.isfile(selected_log_path):
+        return
 
-        if df.empty:
-            st.info(f"The selected log `{os.path.basename(selected_log_path)}` contains 0 records.")
+    df = load_log_data(selected_log_path)
+    if df.empty:
+        st.info(f"The selected log `{os.path.basename(selected_log_path)}` contains 0 records.")
+        return
+
+    # Precompute summary column for high-speed searching and grid display
+    if "_summary_cached" not in df.columns:
+        df["_summary_cached"] = df.apply(compute_event_summary, axis=1)
+
+    # 1. COLLAPSIBLE "▸ ADVANCED FILTERS" ACCORDION
+    with st.expander("▸ Advanced filters", expanded=False):
+        st.caption("Filter records by Event ID, Level, Provider, Channel, Computer, or Keyword.")
+
+        flt_r1c1, flt_r1c2, flt_r1c3 = st.columns([2, 1, 1])
+        with flt_r1c1:
+            filter_keyword = st.text_input(
+                "Keyword Search:",
+                placeholder="Search across EventData, Message, Provider, Computer, UserID...",
+                key="flt_keyword",
+            )
+        with flt_r1c2:
+            all_eids = sorted(df["EventID"].unique().tolist()) if "EventID" in df.columns else []
+            sel_eids = st.multiselect("Event ID:", options=all_eids, key="flt_eids")
+        with flt_r1c3:
+            all_levels = sorted([lvl for lvl in df["LevelName"].unique().tolist() if lvl]) if "LevelName" in df.columns else []
+            sel_levels = st.multiselect("Severity Level:", options=all_levels, key="flt_levels")
+
+        flt_r2c1, flt_r2c2, flt_r2c3 = st.columns(3)
+        with flt_r2c1:
+            all_providers = sorted([pr for pr in df["Provider"].unique().tolist() if pr]) if "Provider" in df.columns else []
+            sel_providers = st.multiselect("Provider:", options=all_providers, key="flt_providers")
+        with flt_r2c2:
+            all_channels = sorted([ch for ch in df["Channel"].unique().tolist() if ch]) if "Channel" in df.columns else []
+            sel_channels = st.multiselect("Channel:", options=all_channels, key="flt_channels")
+        with flt_r2c3:
+            all_computers = sorted([comp for comp in df["Computer"].unique().tolist() if comp]) if "Computer" in df.columns else []
+            sel_computers = st.multiselect("Computer:", options=all_computers, key="flt_computers")
+
+        col_reset, _ = st.columns([1, 4])
+        with col_reset:
+            if st.button("↺ Reset All Filters", **stretch_kw()):
+                st.session_state["flt_keyword"] = ""
+                st.session_state["flt_eids"] = []
+                st.session_state["flt_levels"] = []
+                st.session_state["flt_providers"] = []
+                st.session_state["flt_channels"] = []
+                st.session_state["flt_computers"] = []
+                st.session_state["grid_page"] = 1
+                st.rerun()
+
+    # Apply Filters
+    filtered_df = df.copy()
+    if filter_keyword:
+        kw = filter_keyword.strip().lower()
+        mask = pd.Series(False, index=filtered_df.index)
+        search_columns = [
+            "_summary_cached", "EventData", "UserData", "Message",
+            "Provider", "Channel", "Computer", "UserID", "EventID", "Task", "RecordID",
+        ]
+        for col in search_columns:
+            if col in filtered_df.columns:
+                mask = mask | filtered_df[col].astype(str).str.lower().str.contains(kw, regex=False, na=False)
+        filtered_df = filtered_df[mask]
+
+    if sel_eids:
+        filtered_df = filtered_df[filtered_df["EventID"].isin(sel_eids)]
+    if sel_levels:
+        filtered_df = filtered_df[filtered_df["LevelName"].isin(sel_levels)]
+    if sel_providers:
+        filtered_df = filtered_df[filtered_df["Provider"].isin(sel_providers)]
+    if sel_channels:
+        filtered_df = filtered_df[filtered_df["Channel"].isin(sel_channels)]
+    if sel_computers:
+        filtered_df = filtered_df[filtered_df["Computer"].isin(sel_computers)]
+
+    # 2. TOP ACTION BAR (1-CLICK EXPORTS & LIVE COUNTER)
+    st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
+    act_col_left, act_col_csv, act_col_json, act_col_xml = st.columns([3, 1, 1, 1])
+
+    with act_col_left:
+        base_name = os.path.basename(selected_log_path)
+        if len(filtered_df) == len(df):
+            st.markdown(
+                f"<div style='line-height: 38px; color: #0F172A; font-weight: 600; font-size: 0.92rem;'>"
+                f"<b>{base_name}</b> &nbsp;•&nbsp; <span class='filter-indicator-pill'>{len(df):,} total records</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
         else:
-            # Precompute summary column for high-speed searching and grid display
-            if "_summary_cached" not in df.columns:
-                df["_summary_cached"] = df.apply(compute_event_summary, axis=1)
+            st.markdown(
+                f"<div style='line-height: 38px; color: #0F172A; font-weight: 600; font-size: 0.92rem;'>"
+                f"<b>{base_name}</b> &nbsp;•&nbsp; <span class='filter-indicator-pill'>Showing {len(filtered_df):,} of {len(df):,} records (Filtered)</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-            # ------------------------------------------------------------------
-            # 1. COLLAPSIBLE "▸ ADVANCED FILTERS" ACCORDION
-            # ------------------------------------------------------------------
-            with st.expander("▸ Advanced filters", expanded=False):
-                st.caption("Filter records by Event ID, Level, Provider, Channel, Computer, or Keyword.")
+    # Export filtered records to CSV
+    with act_col_csv:
+        csv_payload = filtered_df[[c for c in CSV_COLUMNS if c in filtered_df.columns]].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="📥 Export CSV",
+            data=csv_payload,
+            file_name=f"export_{base_name.rsplit('.', 1)[0]}.csv",
+            mime="text/csv",
+            **stretch_kw(),
+        )
 
-                flt_r1c1, flt_r1c2, flt_r1c3 = st.columns([2, 1, 1])
-                with flt_r1c1:
-                    filter_keyword = st.text_input(
-                        "Keyword Search:",
-                        placeholder="Search across EventData, Message, Provider, Computer, UserID...",
-                        key="flt_keyword",
-                    )
-                with flt_r1c2:
-                    all_eids = sorted(df["EventID"].unique().tolist()) if "EventID" in df.columns else []
-                    sel_eids = st.multiselect("Event ID:", options=all_eids, key="flt_eids")
-                with flt_r1c3:
-                    all_levels = sorted([lvl for lvl in df["LevelName"].unique().tolist() if lvl]) if "LevelName" in df.columns else []
-                    sel_levels = st.multiselect("Severity Level:", options=all_levels, key="flt_levels")
+    # Export filtered records to JSON
+    with act_col_json:
+        json_payload = filtered_df[[c for c in CSV_COLUMNS if c in filtered_df.columns]].to_json(orient="records", indent=2).encode("utf-8")
+        st.download_button(
+            label="📥 Export JSON",
+            data=json_payload,
+            file_name=f"export_{base_name.rsplit('.', 1)[0]}.json",
+            mime="application/json",
+            **stretch_kw(),
+        )
 
-                flt_r2c1, flt_r2c2, flt_r2c3 = st.columns(3)
-                with flt_r2c1:
-                    all_providers = sorted([pr for pr in df["Provider"].unique().tolist() if pr]) if "Provider" in df.columns else []
-                    sel_providers = st.multiselect("Provider:", options=all_providers, key="flt_providers")
-                with flt_r2c2:
-                    all_channels = sorted([ch for ch in df["Channel"].unique().tolist() if ch]) if "Channel" in df.columns else []
-                    sel_channels = st.multiselect("Channel:", options=all_channels, key="flt_channels")
-                with flt_r2c3:
-                    all_computers = sorted([comp for comp in df["Computer"].unique().tolist() if comp]) if "Computer" in df.columns else []
-                    sel_computers = st.multiselect("Computer:", options=all_computers, key="flt_computers")
+    # Export filtered records to XML
+    with act_col_xml:
+        records_dict = filtered_df[[c for c in CSV_COLUMNS if c in filtered_df.columns]].to_dict(orient="records")
+        xml_payload = records_to_xml(records_dict).encode("utf-8") if records_to_xml else b""
+        st.download_button(
+            label="📥 Export XML",
+            data=xml_payload,
+            file_name=f"export_{base_name.rsplit('.', 1)[0]}.xml",
+            mime="application/xml",
+            **stretch_kw(),
+        )
 
-                col_reset, _ = st.columns([1, 4])
-                with col_reset:
-                    if st.button("↺ Reset All Filters", **stretch_kw()):
-                        st.session_state["flt_keyword"] = ""
-                        st.session_state["flt_eids"] = []
-                        st.session_state["flt_levels"] = []
-                        st.session_state["flt_providers"] = []
-                        st.session_state["flt_channels"] = []
-                        st.session_state["flt_computers"] = []
-                        st.session_state["grid_page"] = 1
-                        st.rerun()
+    st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
 
-            # Apply Filters
-            filtered_df = df.copy()
+    # 3. FORENSIC GRID TABLE & CONTROLS
+    if filtered_df.empty:
+        st.info("No event records match the current filter criteria.")
+        return
 
-            if filter_keyword:
-                kw = filter_keyword.strip().lower()
-                mask = pd.Series(False, index=filtered_df.index)
-                search_columns = [
-                    "_summary_cached",
-                    "EventData",
-                    "UserData",
-                    "Message",
-                    "Provider",
-                    "Channel",
-                    "Computer",
-                    "UserID",
-                    "EventID",
-                    "Task",
-                    "RecordID",
-                ]
-                for col in search_columns:
-                    if col in filtered_df.columns:
-                        mask = mask | filtered_df[col].astype(str).str.lower().str.contains(kw, regex=False, na=False)
-                filtered_df = filtered_df[mask]
+    sort_asc = st.session_state.get("grid_sort_asc", True)
+    if "RecordID" in filtered_df.columns:
+        filtered_df["_rec_num"] = pd.to_numeric(filtered_df["RecordID"], errors="coerce").fillna(0)
+        filtered_df = filtered_df.sort_values(by="_rec_num", ascending=sort_asc)
 
-            if sel_eids:
-                filtered_df = filtered_df[filtered_df["EventID"].isin(sel_eids)]
+    # Pagination controls
+    total_filtered = len(filtered_df)
+    page_size = st.session_state.get("grid_page_size", 25)
+    total_pages = max(1, (total_filtered + page_size - 1) // page_size)
 
-            if sel_levels:
-                filtered_df = filtered_df[filtered_df["LevelName"].isin(sel_levels)]
+    current_page = min(max(1, st.session_state.get("grid_page", 1)), total_pages)
+    st.session_state["grid_page"] = current_page
 
-            if sel_providers:
-                filtered_df = filtered_df[filtered_df["Provider"].isin(sel_providers)]
+    pg_c1, pg_sort, pg_c2, pg_c3, pg_c4, pg_c5, pg_c6 = st.columns([1.1, 1.6, 0.7, 0.7, 1.5, 0.7, 0.7])
+    with pg_c1:
+        new_size = st.selectbox(
+            "Page size:",
+            options=[25, 50, 100],
+            index=[25, 50, 100].index(page_size) if page_size in [25, 50, 100] else 0,
+            key="sel_page_size",
+            label_visibility="collapsed",
+        )
+        if new_size != page_size:
+            st.session_state["grid_page_size"] = new_size
+            st.session_state["grid_page"] = 1
+            st.rerun()
 
-            if sel_channels:
-                filtered_df = filtered_df[filtered_df["Channel"].isin(sel_channels)]
+    with pg_sort:
+        sort_lbl = f"⇅ Sort: Record # ({'Asc ↑' if sort_asc else 'Desc ↓'})"
+        if st.button(sort_lbl, key="btn_toggle_sort", **stretch_kw()):
+            st.session_state["grid_sort_asc"] = not sort_asc
+            st.rerun()
 
-            if sel_computers:
-                filtered_df = filtered_df[filtered_df["Computer"].isin(sel_computers)]
+    with pg_c2:
+        if st.button("⏮ First", disabled=(current_page == 1), **stretch_kw()):
+            st.session_state["grid_page"] = 1
+            st.rerun()
+    with pg_c3:
+        if st.button("◀ Prev", disabled=(current_page == 1), **stretch_kw()):
+            st.session_state["grid_page"] = current_page - 1
+            st.rerun()
+    with pg_c4:
+        start_num = (current_page - 1) * page_size + 1
+        end_num = min(current_page * page_size, total_filtered)
+        st.markdown(
+            f"<div style='text-align: center; font-size: 0.82rem; line-height: 32px; color: #475569; font-weight: 600;'>"
+            f"Page <b>{current_page}</b> of <b>{total_pages}</b> &nbsp;({start_num:,} - {end_num:,} of {total_filtered:,})"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with pg_c5:
+        if st.button("Next ▶", disabled=(current_page == total_pages), **stretch_kw()):
+            st.session_state["grid_page"] = current_page + 1
+            st.rerun()
+    with pg_c6:
+        if st.button("Last ⏭", disabled=(current_page == total_pages), **stretch_kw()):
+            st.session_state["grid_page"] = total_pages
+            st.rerun()
 
-            # ------------------------------------------------------------------
-            # 2. TOP ACTION BAR (1-CLICK EXPORTS & LIVE COUNTER)
-            # ------------------------------------------------------------------
-            st.markdown("<div style='height: 4px;'></div>", unsafe_allow_html=True)
-            act_col_left, act_col_csv, act_col_json, act_col_xml = st.columns([3, 1, 1, 1])
+    start_idx = (current_page - 1) * page_size
+    page_df = filtered_df.iloc[start_idx : start_idx + page_size]
 
-            with act_col_left:
-                base_name = os.path.basename(selected_log_path)
-                if len(filtered_df) == len(df):
-                    st.markdown(
-                        f"<div style='line-height: 38px; color: #0F172A; font-weight: 600; font-size: 0.92rem;'>"
-                        f"<b>{base_name}</b> &nbsp;•&nbsp; <span class='filter-indicator-pill'>{len(df):,} total records</span>"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.markdown(
-                        f"<div style='line-height: 38px; color: #0F172A; font-weight: 600; font-size: 0.92rem;'>"
-                        f"<b>{base_name}</b> &nbsp;•&nbsp; <span class='filter-indicator-pill'>Showing {len(filtered_df):,} of {len(df):,} records (Filtered)</span>"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
+    sort_symbol = "↑" if sort_asc else "↓"
+    th_col_widths = [1.0, 1.8, 1.0, 0.9, 1.2, 2.2, 1.4, 1.5, 1.0]
 
-            # Export filtered records to CSV
-            with act_col_csv:
-                csv_payload = filtered_df[[c for c in CSV_COLUMNS if c in filtered_df.columns]].to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    label="📥 Export CSV",
-                    data=csv_payload,
-                    file_name=f"export_{base_name.rsplit('.', 1)[0]}.csv",
-                    mime="text/csv",
-                    **stretch_kw(),
-                )
+    th_c1, th_c2, th_c3, th_c4, th_c5, th_c6, th_c7, th_c8, th_c9 = st.columns(th_col_widths)
+    with th_c1:
+        st.markdown(f"<span class='th-cell'>Record # {sort_symbol}</span>", unsafe_allow_html=True)
+    with th_c2:
+        st.markdown("<span class='th-cell'>Time (UTC)</span>", unsafe_allow_html=True)
+    with th_c3:
+        st.markdown("<span class='th-cell'>Level</span>", unsafe_allow_html=True)
+    with th_c4:
+        st.markdown("<span class='th-cell'>Event ID</span>", unsafe_allow_html=True)
+    with th_c5:
+        st.markdown("<span class='th-cell'>Task / Name</span>", unsafe_allow_html=True)
+    with th_c6:
+        st.markdown("<span class='th-cell'>Provider</span>", unsafe_allow_html=True)
+    with th_c7:
+        st.markdown("<span class='th-cell'>Channel</span>", unsafe_allow_html=True)
+    with th_c8:
+        st.markdown("<span class='th-cell'>Computer</span>", unsafe_allow_html=True)
+    with th_c9:
+        st.markdown("<span class='th-cell' style='text-align: center; justify-content: center;'>Action</span>", unsafe_allow_html=True)
 
-            # Export filtered records to JSON
-            with act_col_json:
-                json_payload = filtered_df[[c for c in CSV_COLUMNS if c in filtered_df.columns]].to_json(orient="records", indent=2).encode("utf-8")
-                st.download_button(
-                    label="📥 Export JSON",
-                    data=json_payload,
-                    file_name=f"export_{base_name.rsplit('.', 1)[0]}.json",
-                    mime="application/json",
-                    **stretch_kw(),
-                )
+    expanded_id = st.session_state.get("expanded_record_id")
 
-            # Export filtered records to XML
-            with act_col_xml:
-                records_dict = filtered_df[[c for c in CSV_COLUMNS if c in filtered_df.columns]].to_dict(orient="records")
-                xml_payload = records_to_xml(records_dict).encode("utf-8")
-                st.download_button(
-                    label="📥 Export XML",
-                    data=xml_payload,
-                    file_name=f"export_{base_name.rsplit('.', 1)[0]}.xml",
-                    mime="application/xml",
-                    **stretch_kw(),
-                )
+    for _, row in page_df.iterrows():
+        rec_id = str(row.get("RecordID", "")).strip()
+        is_expanded = (expanded_id is not None and expanded_id == rec_id)
 
-            st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+        raw_time = row.get("TimeCreated", "")
+        time_display = format_time_utc(raw_time)
 
-            # ------------------------------------------------------------------
-            # 3. FORENSIC GRID TABLE & CONTROLS
-            # ------------------------------------------------------------------
-            if filtered_df.empty:
-                st.info("No event records match the current filter criteria.")
+        lvl_name = str(row.get("LevelName", "")).strip() or "Information"
+        lvl_lower = lvl_name.lower()
+        if "error" in lvl_lower:
+            lvl_badge_class = "badge-error"
+        elif "crit" in lvl_lower:
+            lvl_badge_class = "badge-critical"
+        elif "warn" in lvl_lower:
+            lvl_badge_class = "badge-warning"
+        elif "info" in lvl_lower:
+            lvl_badge_class = "badge-info"
+        else:
+            lvl_badge_class = "badge-verbose"
+
+        eid_val = str(row.get("EventID", "")).strip()
+        name_val = str(row.get("Task", "")).strip()
+        if not name_val or name_val in ("0", "none", "nan"):
+            name_val = "-"
+
+        prov_val = str(row.get("Provider", "")).strip() or "-"
+        chan_val = str(row.get("Channel", "")).strip() or "-"
+        comp_val = str(row.get("Computer", "")).strip() or "-"
+
+        c_rec, c_time, c_lvl, c_eid, c_name, c_prov, c_chan, c_comp, c_act = st.columns(th_col_widths)
+
+        with c_rec:
+            st.markdown(f"<span class='cell-mono'>{html.escape(rec_id)}</span>", unsafe_allow_html=True)
+        with c_time:
+            st.markdown(f"<span class='cell-time' title='{html.escape(str(raw_time))}'>{html.escape(time_display)}</span>", unsafe_allow_html=True)
+        with c_lvl:
+            st.markdown(f"<span class='{lvl_badge_class}'>{html.escape(lvl_name)}</span>", unsafe_allow_html=True)
+        with c_eid:
+            st.markdown(f"<span class='cell-mono'>{html.escape(eid_val)}</span>", unsafe_allow_html=True)
+        with c_name:
+            st.markdown(f"<span class='cell-text' title='{html.escape(name_val)}'>{html.escape(name_val)}</span>", unsafe_allow_html=True)
+        with c_prov:
+            st.markdown(f"<span class='cell-text' title='{html.escape(prov_val)}'>{html.escape(prov_val)}</span>", unsafe_allow_html=True)
+        with c_chan:
+            st.markdown(f"<span class='cell-text' title='{html.escape(chan_val)}'>{html.escape(chan_val)}</span>", unsafe_allow_html=True)
+        with c_comp:
+            st.markdown(f"<span class='cell-mono' title='{html.escape(comp_val)}'>{html.escape(comp_val)}</span>", unsafe_allow_html=True)
+
+        with c_act:
+            if is_expanded:
+                if st.button("Close", key=f"btn_close_row_{rec_id}", type="primary", **stretch_kw()):
+                    st.session_state["expanded_record_id"] = None
+                    st.session_state["raw_view_mode"] = None
+                    st.rerun()
             else:
-                sort_asc = st.session_state.get("grid_sort_asc", True)
-                if "RecordID" in filtered_df.columns:
-                    filtered_df["_rec_num"] = pd.to_numeric(filtered_df["RecordID"], errors="coerce").fillna(0)
-                    filtered_df = filtered_df.sort_values(by="_rec_num", ascending=sort_asc)
+                if st.button("Details", key=f"btn_det_row_{rec_id}", **stretch_kw()):
+                    st.session_state["expanded_record_id"] = rec_id
+                    st.session_state["raw_view_mode"] = None
+                    st.rerun()
 
-                # Pagination controls
-                total_filtered = len(filtered_df)
-                page_size = st.session_state.get("grid_page_size", 25)
-                total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+        # INLINE EVENT DATA DRAWER
+        if is_expanded:
+            ed_raw = str(row.get("EventData", "")).strip()
+            unpacked_ed = unpack_event_data_dict(ed_raw)
 
-                current_page = min(max(1, st.session_state.get("grid_page", 1)), total_pages)
-                st.session_state["grid_page"] = current_page
-
-                # Pagination & Sorting Toolbar
-                pg_c1, pg_sort, pg_c2, pg_c3, pg_c4, pg_c5, pg_c6 = st.columns([1.1, 1.6, 0.7, 0.7, 1.5, 0.7, 0.7])
-                with pg_c1:
-                    new_size = st.selectbox(
-                        "Page size:",
-                        options=[25, 50, 100],
-                        index=[25, 50, 100].index(page_size) if page_size in [25, 50, 100] else 0,
-                        key="sel_page_size",
-                        label_visibility="collapsed",
+            payload_lines = []
+            if unpacked_ed:
+                for pk, pv in unpacked_ed.items():
+                    val_clean = str(pv).strip().replace("\r\n", "\n")
+                    safe_pk = html.escape(str(pk)).replace("`", "&#96;")
+                    safe_pv = html.escape(val_clean).replace("`", "&#96;").replace("*", "&#42;").replace("_", "&#95;")
+                    safe_pv_html = safe_pv.replace("\n", "<br>")
+                    payload_lines.append(
+                        f"<div style='margin-bottom: 8px;'>"
+                        f"<span class='forensic-payload-key'>{safe_pk}</span> "
+                        f"<span class='forensic-payload-val' style='font-family: inherit; color: #F8FAFC;'>{safe_pv_html}</span>"
+                        f"</div>"
                     )
-                    if new_size != page_size:
-                        st.session_state["grid_page_size"] = new_size
-                        st.session_state["grid_page"] = 1
-                        st.rerun()
+            else:
+                msg_clean = str(row.get("Message", "")).strip().replace("\r\n", "\n")
+                if msg_clean:
+                    safe_msg = html.escape(msg_clean).replace("`", "&#96;").replace("*", "&#42;").replace("_", "&#95;").replace("\n", "<br>")
+                    payload_lines.append(f"<span class='forensic-payload-val' style='color: #F8FAFC;'>{safe_msg}</span>")
+                else:
+                    payload_lines.append("<span style='color: #94A3B8;'>No EventData or payload parameters attached to this record.</span>")
 
-                with pg_sort:
-                    sort_lbl = f"⇅ Sort: Record # ({'Asc ↑' if sort_asc else 'Desc ↓'})"
-                    if st.button(sort_lbl, key="btn_toggle_sort", **stretch_kw()):
-                        st.session_state["grid_sort_asc"] = not sort_asc
-                        st.rerun()
+            payload_html = "".join(payload_lines)
+            st.markdown(
+                f'<div class="forensic-drawer">'
+                f'<div class="forensic-drawer-title">EVENT DATA</div>'
+                f'<div class="forensic-payload-box">{payload_html}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
-                with pg_c2:
-                    if st.button("⏮ First", disabled=(current_page == 1), **stretch_kw()):
-                        st.session_state["grid_page"] = 1
-                        st.rerun()
-                with pg_c3:
-                    if st.button("◀ Prev", disabled=(current_page == 1), **stretch_kw()):
-                        st.session_state["grid_page"] = current_page - 1
-                        st.rerun()
-                with pg_c4:
-                    start_num = (current_page - 1) * page_size + 1
-                    end_num = min(current_page * page_size, total_filtered)
-                    st.markdown(
-                        f"<div style='text-align: center; font-size: 0.82rem; line-height: 32px; color: #475569; font-weight: 600;'>"
-                        f"Page <b>{current_page}</b> of <b>{total_pages}</b> &nbsp;({start_num:,} - {end_num:,} of {total_filtered:,})"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-                with pg_c5:
-                    if st.button("Next ▶", disabled=(current_page == total_pages), **stretch_kw()):
-                        st.session_state["grid_page"] = current_page + 1
-                        st.rerun()
-                with pg_c6:
-                    if st.button("Last ⏭", disabled=(current_page == total_pages), **stretch_kw()):
-                        st.session_state["grid_page"] = total_pages
-                        st.rerun()
+            # Drawer Action Bar
+            d_c1, d_c2, d_c3, d_c4, _ = st.columns([1.3, 1.3, 2.2, 1.0, 2.2])
+            with d_c1:
+                xml_active = (st.session_state.get("raw_view_mode") == "xml")
+                btn_xml_label = "Hide raw XML" if xml_active else "Show raw XML"
+                if st.button(btn_xml_label, key=f"drawer_xml_{rec_id}", **stretch_kw()):
+                    st.session_state["raw_view_mode"] = None if xml_active else "xml"
+                    st.rerun()
 
-                # Slice records for current page
-                start_idx = (current_page - 1) * page_size
-                page_df = filtered_df.iloc[start_idx : start_idx + page_size]
+            with d_c2:
+                json_active = (st.session_state.get("raw_view_mode") == "json")
+                btn_json_label = "Hide raw JSON" if json_active else "Show raw JSON"
+                if st.button(btn_json_label, key=f"drawer_json_{rec_id}", **stretch_kw()):
+                    st.session_state["raw_view_mode"] = None if json_active else "json"
+                    st.rerun()
 
-                # --------------------------------------------------------------
-                # TABLE HEADER ROW (FLEXBOX SINGLE CONTAINER)
-                # Exact columns: Record # ↑ | Time (UTC) | Level | Event ID | Name | Provider | Channel | Computer | Action
-                # --------------------------------------------------------------
-                sort_symbol = "↑" if sort_asc else "↓"
-                th_col_widths = [1.2, 1.8, 1.1, 1.1, 1.1, 2.2, 1.8, 1.8, 1.1]
+            with d_c3:
+                corr_active = (st.session_state.get("raw_view_mode") == "corr")
+                btn_corr_label = "Hide Correlated" if corr_active else "🔗 Correlate Across Channels"
+                if st.button(btn_corr_label, key=f"drawer_corr_{rec_id}", **stretch_kw()):
+                    st.session_state["raw_view_mode"] = None if corr_active else "corr"
+                    st.rerun()
 
-                th_c1, th_c2, th_c3, th_c4, th_c5, th_c6, th_c7, th_c8, th_c9 = st.columns(th_col_widths)
-                with th_c1:
-                    st.markdown(f"<span class='th-cell'>Record # {sort_symbol}</span>", unsafe_allow_html=True)
-                with th_c2:
-                    st.markdown("<span class='th-cell'>Time (UTC)</span>", unsafe_allow_html=True)
-                with th_c3:
-                    st.markdown("<span class='th-cell'>Level</span>", unsafe_allow_html=True)
-                with th_c4:
-                    st.markdown("<span class='th-cell'>Event ID</span>", unsafe_allow_html=True)
-                with th_c5:
-                    st.markdown("<span class='th-cell'>Task / Name</span>", unsafe_allow_html=True)
-                with th_c6:
-                    st.markdown("<span class='th-cell'>Provider</span>", unsafe_allow_html=True)
-                with th_c7:
-                    st.markdown("<span class='th-cell'>Channel</span>", unsafe_allow_html=True)
-                with th_c8:
-                    st.markdown("<span class='th-cell'>Computer</span>", unsafe_allow_html=True)
-                with th_c9:
-                    st.markdown("<span class='th-cell' style='text-align: center;'>Action</span>", unsafe_allow_html=True)
+            with d_c4:
+                if st.button("Close", key=f"drawer_close_{rec_id}", **stretch_kw()):
+                    st.session_state["expanded_record_id"] = None
+                    st.session_state["raw_view_mode"] = None
+                    st.rerun()
 
-                # --------------------------------------------------------------
-                # TABLE ROWS & INLINE EVENT DATA DRAWER
-                # --------------------------------------------------------------
-                expanded_id = st.session_state.get("expanded_record_id")
+            # Raw XML display
+            if st.session_state.get("raw_view_mode") == "xml":
+                clean_rec = row.to_dict()
+                clean_rec = {k: v for k, v in clean_rec.items() if not k.startswith("_")}
+                raw_xml_text = record_to_xml(clean_rec) if record_to_xml else ""
+                st.caption("Standard Windows Event XML:")
+                st.code(raw_xml_text, language="xml")
 
-                for _, row in page_df.iterrows():
-                    rec_id = str(row.get("RecordID", "")).strip()
-                    is_expanded = (expanded_id is not None and expanded_id == rec_id)
+            # Raw JSON display
+            elif st.session_state.get("raw_view_mode") == "json":
+                clean_rec = row.to_dict()
+                clean_rec = {k: v for k, v in clean_rec.items() if not k.startswith("_")}
+                raw_json_text = json.dumps(clean_rec, indent=2)
+                st.caption("Standard Structured JSON Record:")
+                st.code(raw_json_text, language="json")
 
-                    raw_time = row.get("TimeCreated", "")
-                    time_display = format_time_utc(raw_time)
+            # Cross-Channel Correlated Events display
+            elif st.session_state.get("raw_view_mode") == "corr":
+                conn = get_duckdb_conn()
+                all_tbls = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
+                if "entity_correlations" in all_tbls:
+                    corrs = find_correlated(conn, anchor_event_record_id=rec_id, limit=25)
+                    if corrs:
+                        st.markdown(f"##### 🔗 Correlated Events for Record `#{rec_id}` ({len(corrs):,} found)")
+                        corr_df = pd.DataFrame(corrs)
+                        disp_c = [c for c in ["time_delta_str", "source_type", "event_id", "entity_type", "entity_value", "confidence", "relation_reason"] if c in corr_df.columns]
+                        corr_df_renamed = corr_df[disp_c].rename(columns={
+                            "time_delta_str": "Time Offset (Δt)",
+                            "source_type": "Channel",
+                            "event_id": "Event ID",
+                            "entity_type": "Linked Entity",
+                            "entity_value": "Entity Value",
+                            "confidence": "Confidence",
+                            "relation_reason": "Relation",
+                        })
+                        st.dataframe(corr_df_renamed, **stretch_kw())
 
-                    lvl_name = str(row.get("LevelName", "")).strip() or "Information"
-                    lvl_lower = lvl_name.lower()
-                    if "error" in lvl_lower:
-                        lvl_badge_class = "badge-error"
-                    elif "crit" in lvl_lower:
-                        lvl_badge_class = "badge-critical"
-                    elif "warn" in lvl_lower:
-                        lvl_badge_class = "badge-warning"
-                    elif "info" in lvl_lower:
-                        lvl_badge_class = "badge-info"
+                        ask_col, _ = st.columns([3.0, 4.0])
+                        with ask_col:
+                            if st.button(f"💬 Ask Assistant: What else happened around record {rec_id}?", key=f"btn_ask_corr_{rec_id}", **stretch_kw()):
+                                st.session_state["active_tab"] = "assistant"
+                                st.session_state["chatbot_messages"].append({
+                                    "role": "user",
+                                    "content": f"What else happened around record {rec_id}?",
+                                    "evidence": None,
+                                    "filter_card": None,
+                                    "templates": None,
+                                })
+                                st.rerun()
                     else:
-                        lvl_badge_class = "badge-verbose"
+                        st.info(f"No cross-channel correlated events found within temporal proximity windows for Record #{rec_id}.")
+                else:
+                    st.info("Correlation index is not yet built in DuckDB. Open the **Forensic Assistant** tab to automatically index correlations.")
 
-                    eid_val = str(row.get("EventID", "")).strip()
-                    name_val = str(row.get("Task", "")).strip()
-                    if not name_val or name_val in ("0", "none", "nan"):
-                        name_val = "-"
+    # 4. COLLAPSIBLE VISUAL ANALYTICS & METRICS
+    st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
+    with st.expander("📊 Visual Analytics & Metrics", expanded=False):
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        with kpi1:
+            st.metric("Total Filtered Events", f"{len(filtered_df):,}")
+        with kpi2:
+            u_eids = filtered_df["EventID"].nunique() if "EventID" in filtered_df.columns else 0
+            st.metric("Unique Event IDs", f"{u_eids:,}")
+        with kpi3:
+            u_prov = filtered_df["Provider"].nunique() if "Provider" in filtered_df.columns else 0
+            st.metric("Providers", f"{u_prov:,}")
+        with kpi4:
+            u_chan = filtered_df["Channel"].nunique() if "Channel" in filtered_df.columns else 0
+            st.metric("Channels", f"{u_chan:,}")
 
-                    prov_val = str(row.get("Provider", "")).strip() or "-"
-                    chan_val = str(row.get("Channel", "")).strip() or "-"
-                    comp_val = str(row.get("Computer", "")).strip() or "-"
+        st.markdown("---")
+        chart_col1, chart_col2 = st.columns(2)
+        with chart_col1:
+            if "EventID" in filtered_df.columns and not filtered_df.empty:
+                top_e = filtered_df["EventID"].astype(str).value_counts().head(10).reset_index()
+                top_e.columns = ["EventID", "Count"]
+                fig_e = px.bar(
+                    top_e,
+                    x="EventID",
+                    y="Count",
+                    title=f"Top 10 Event IDs ({os.path.basename(selected_log_path)})",
+                    text="Count",
+                    color="Count",
+                    color_continuous_scale="Blues",
+                )
+                fig_e.update_xaxes(type="category")
+                fig_e.update_layout(margin=dict(l=20, r=20, t=40, b=20), height=320)
+                st.plotly_chart(fig_e, **stretch_kw())
 
-                    c_rec, c_time, c_lvl, c_eid, c_name, c_prov, c_chan, c_comp, c_act = st.columns(th_col_widths)
-
-                    with c_rec:
-                        st.markdown(f"<span class='cell-mono'>{html.escape(rec_id)}</span>", unsafe_allow_html=True)
-                    with c_time:
-                        st.markdown(f"<span class='cell-time' title='{html.escape(str(raw_time))}'>{html.escape(time_display)}</span>", unsafe_allow_html=True)
-                    with c_lvl:
-                        st.markdown(f"<span class='{lvl_badge_class}'>{html.escape(lvl_name)}</span>", unsafe_allow_html=True)
-                    with c_eid:
-                        st.markdown(f"<span class='cell-mono'>{html.escape(eid_val)}</span>", unsafe_allow_html=True)
-                    with c_name:
-                        st.markdown(f"<span class='cell-text' title='{html.escape(name_val)}'>{html.escape(name_val)}</span>", unsafe_allow_html=True)
-                    with c_prov:
-                        st.markdown(f"<span class='cell-text' title='{html.escape(prov_val)}'>{html.escape(prov_val)}</span>", unsafe_allow_html=True)
-                    with c_chan:
-                        st.markdown(f"<span class='cell-text' title='{html.escape(chan_val)}'>{html.escape(chan_val)}</span>", unsafe_allow_html=True)
-                    with c_comp:
-                        st.markdown(f"<span class='cell-mono' title='{html.escape(comp_val)}'>{html.escape(comp_val)}</span>", unsafe_allow_html=True)
-
-                    with c_act:
-                        if is_expanded:
-                            if st.button("Close", key=f"btn_close_row_{rec_id}", type="primary", **stretch_kw()):
-                                st.session_state["expanded_record_id"] = None
-                                st.session_state["raw_view_mode"] = None
-                                st.rerun()
-                        else:
-                            if st.button("Details", key=f"btn_det_row_{rec_id}", **stretch_kw()):
-                                st.session_state["expanded_record_id"] = rec_id
-                                st.session_state["raw_view_mode"] = None
-                                st.rerun()
-
-                    # ----------------------------------------------------------
-                    # INLINE EVENT DATA DRAWER (IF EXPANDED)
-                    # ----------------------------------------------------------
-                    if is_expanded:
-                        ed_raw = str(row.get("EventData", "")).strip()
-                        unpacked_ed = unpack_event_data_dict(ed_raw)
-
-                        payload_lines = []
-                        if unpacked_ed:
-                            for pk, pv in unpacked_ed.items():
-                                val_clean = str(pv).strip().replace("\r\n", "\n")
-                                safe_pk = html.escape(str(pk)).replace("`", "&#96;")
-                                # Escape markdown special chars so stack traces never parse as code blocks/lists
-                                safe_pv = html.escape(val_clean).replace("`", "&#96;").replace("*", "&#42;").replace("_", "&#95;")
-                                payload_lines.append(
-                                    f"<div style='margin-bottom: 8px;'>"
-                                    f"<span class='forensic-payload-key'>{safe_pk}</span> "
-                                    f"<span class='forensic-payload-val' style='font-family: inherit; color: #F8FAFC;'>{safe_pv}</span>"
-                                    f"</div>"
-                                )
-                        else:
-                            msg_clean = str(row.get("Message", "")).strip()
-                            if msg_clean:
-                                safe_msg = html.escape(msg_clean).replace("`", "&#96;").replace("*", "&#42;").replace("_", "&#95;")
-                                payload_lines.append(f"<span class='forensic-payload-val' style='color: #F8FAFC;'>{safe_msg}</span>")
-                            else:
-                                payload_lines.append("<span style='color: #94A3B8;'>No EventData or payload parameters attached to this record.</span>")
-
-                        payload_html = "".join(payload_lines)
-
-                        st.markdown(
-                            f"""
-                            <div class="forensic-drawer">
-                                <div class="forensic-drawer-title">EVENT DATA</div>
-                                <div class="forensic-payload-box">
-                                    {payload_html}
-                                </div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                        # Drawer Action Bar: Show raw XML | Show raw JSON | Correlate | Close
-                        d_c1, d_c2, d_c3, d_c4, _ = st.columns([1.3, 1.3, 2.2, 1.0, 2.2])
-                        with d_c1:
-                            xml_active = (st.session_state.get("raw_view_mode") == "xml")
-                            btn_xml_label = "Hide raw XML" if xml_active else "Show raw XML"
-                            if st.button(btn_xml_label, key=f"drawer_xml_{rec_id}", **stretch_kw()):
-                                st.session_state["raw_view_mode"] = None if xml_active else "xml"
-                                st.rerun()
-
-                        with d_c2:
-                            json_active = (st.session_state.get("raw_view_mode") == "json")
-                            btn_json_label = "Hide raw JSON" if json_active else "Show raw JSON"
-                            if st.button(btn_json_label, key=f"drawer_json_{rec_id}", **stretch_kw()):
-                                st.session_state["raw_view_mode"] = None if json_active else "json"
-                                st.rerun()
-
-                        with d_c3:
-                            corr_active = (st.session_state.get("raw_view_mode") == "corr")
-                            btn_corr_label = "Hide Correlated" if corr_active else "🔗 Correlate Across Channels"
-                            if st.button(btn_corr_label, key=f"drawer_corr_{rec_id}", **stretch_kw()):
-                                st.session_state["raw_view_mode"] = None if corr_active else "corr"
-                                st.rerun()
-
-                        with d_c4:
-                            if st.button("Close", key=f"drawer_close_{rec_id}", **stretch_kw()):
-                                st.session_state["expanded_record_id"] = None
-                                st.session_state["raw_view_mode"] = None
-                                st.rerun()
-
-                        # Raw XML display
-                        if st.session_state.get("raw_view_mode") == "xml":
-                            clean_rec = row.to_dict()
-                            clean_rec = {k: v for k, v in clean_rec.items() if not k.startswith("_")}
-                            raw_xml_text = record_to_xml(clean_rec)
-                            st.caption("Standard Windows Event XML:")
-                            st.code(raw_xml_text, language="xml")
-
-                        # Raw JSON display
-                        elif st.session_state.get("raw_view_mode") == "json":
-                            clean_rec = row.to_dict()
-                            clean_rec = {k: v for k, v in clean_rec.items() if not k.startswith("_")}
-                            raw_json_text = json.dumps(clean_rec, indent=2)
-                            st.caption("Standard Structured JSON Record:")
-                            st.code(raw_json_text, language="json")
-
-                        # Cross-Channel Correlated Events display
-                        elif st.session_state.get("raw_view_mode") == "corr":
-                            conn = get_duckdb_conn()
-                            all_tbls = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
-                            if "entity_correlations" in all_tbls:
-                                corrs = find_correlated(conn, anchor_event_record_id=rec_id, limit=25)
-                                if corrs:
-                                    st.markdown(f"##### 🔗 Correlated Events for Record `#{rec_id}` ({len(corrs):,} found)")
-                                    corr_df = pd.DataFrame(corrs)
-                                    disp_c = [c for c in ["time_delta_str", "source_type", "event_id", "entity_type", "entity_value", "confidence", "relation_reason"] if c in corr_df.columns]
-                                    corr_df_renamed = corr_df[disp_c].rename(columns={
-                                        "time_delta_str": "Time Offset (Δt)",
-                                        "source_type": "Channel",
-                                        "event_id": "Event ID",
-                                        "entity_type": "Linked Entity",
-                                        "entity_value": "Entity Value",
-                                        "confidence": "Confidence",
-                                        "relation_reason": "Relation",
-                                    })
-                                    st.dataframe(corr_df_renamed, **stretch_kw())
-
-                                    ask_col, _ = st.columns([3.0, 4.0])
-                                    with ask_col:
-                                        if st.button(f"💬 Ask Assistant: What else happened around record {rec_id}?", key=f"btn_ask_corr_{rec_id}", **stretch_kw()):
-                                            st.session_state["active_tab"] = "assistant"
-                                            st.session_state["chatbot_messages"].append({
-                                                "role": "user",
-                                                "content": f"What else happened around record {rec_id}?",
-                                                "evidence": None,
-                                                "filter_card": None,
-                                                "templates": None,
-                                            })
-                                            st.rerun()
-                                else:
-                                    st.info(f"No cross-channel correlated events found within temporal proximity windows for Record #{rec_id}.")
-                            else:
-                                st.info("Correlation index is not yet built in DuckDB. Open the **Forensic Assistant** tab to automatically index correlations.")
-
-            # ------------------------------------------------------------------
-            # 4. COLLAPSIBLE VISUAL ANALYTICS & METRICS
-            # ------------------------------------------------------------------
-            st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
-            with st.expander("📊 Visual Analytics & Metrics", expanded=False):
-                kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-                with kpi1:
-                    st.metric("Total Filtered Events", f"{len(filtered_df):,}")
-                with kpi2:
-                    u_eids = filtered_df["EventID"].nunique() if "EventID" in filtered_df.columns else 0
-                    st.metric("Unique Event IDs", f"{u_eids:,}")
-                with kpi3:
-                    u_prov = filtered_df["Provider"].nunique() if "Provider" in filtered_df.columns else 0
-                    st.metric("Providers", f"{u_prov:,}")
-                with kpi4:
-                    u_chan = filtered_df["Channel"].nunique() if "Channel" in filtered_df.columns else 0
-                    st.metric("Channels", f"{u_chan:,}")
-
-                st.markdown("---")
-                chart_col1, chart_col2 = st.columns(2)
-                with chart_col1:
-                    if "EventID" in filtered_df.columns and not filtered_df.empty:
-                        top_e = filtered_df["EventID"].astype(str).value_counts().head(10).reset_index()
-                        top_e.columns = ["EventID", "Count"]
-                        fig_e = px.bar(
-                            top_e,
-                            x="EventID",
-                            y="Count",
-                            title=f"Top 10 Event IDs ({os.path.basename(selected_log_path)})",
-                            text="Count",
-                            color="Count",
-                            color_continuous_scale="Blues",
-                        )
-                        fig_e.update_xaxes(type="category")
-                        fig_e.update_layout(margin=dict(l=20, r=20, t=40, b=20), height=320)
-                        st.plotly_chart(fig_e, **stretch_kw())
-
-                with chart_col2:
-                    if "Provider" in filtered_df.columns and not filtered_df.empty:
-                        top_p = filtered_df["Provider"].astype(str).value_counts().head(8).reset_index()
-                        top_p.columns = ["Provider", "Count"]
-                        fig_p = px.pie(
-                            top_p,
-                            names="Provider",
-                            values="Count",
-                            title=f"Event Providers Distribution ({os.path.basename(selected_log_path)})",
-                            hole=0.4,
-                        )
-                        fig_p.update_layout(margin=dict(l=20, r=20, t=40, b=20), height=320)
-                        st.plotly_chart(fig_p, **stretch_kw())
+        with chart_col2:
+            if "Provider" in filtered_df.columns and not filtered_df.empty:
+                top_p = filtered_df["Provider"].astype(str).value_counts().head(8).reset_index()
+                top_p.columns = ["Provider", "Count"]
+                fig_p = px.pie(
+                    top_p,
+                    names="Provider",
+                    values="Count",
+                    title=f"Event Providers Distribution ({os.path.basename(selected_log_path)})",
+                    hole=0.4,
+                )
+                fig_p.update_layout(margin=dict(l=20, r=20, t=40, b=20), height=320)
+                st.plotly_chart(fig_p, **stretch_kw())
 
 
-# ==============================================================================
-# VIEW 3: UNIFIED FORENSIC ASSISTANT (GEMINI-STYLE NLP CHAT & TEMPLATE DEDUP)
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# VIEW 3: UNIFIED FORENSIC ASSISTANT (NLP CHAT & RETRIEVAL REASONING)
+# ------------------------------------------------------------------------------
 
-elif st.session_state["active_tab"] == "assistant":
-    # 1. Discover available logs
+def render_assistant_view() -> None:
+    """Renders the AI Assistant with Drain3 clustering, vector search, and Qwen LLM reasoning."""
     csv_dir = st.session_state.get("viewer_folder", "Converted files")
     norm_csv_dir = normalize_path(csv_dir)
-    available_files = []
+    available_files: List[str] = []
     if os.path.isdir(norm_csv_dir):
         for ext in ("*.csv", "*.json", "*.jsonl"):
             available_files.extend(glob.glob(os.path.join(norm_csv_dir, ext)))
@@ -2155,459 +2298,470 @@ elif st.session_state["active_tab"] == "assistant":
         if st.button("🔄 Go to EVTX Converter", type="primary", **stretch_kw()):
             st.session_state["active_tab"] = "converter"
             st.rerun()
-    else:
-        # Scope Selection
-        file_options = {os.path.basename(f): f for f in available_files}
-        log_names = list(file_options.keys())
+        return
 
-        # Sidebar Assistant Controls
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("Investigation Scope")
-        selected_log_name = st.sidebar.selectbox(
-            "Target Log File:",
-            options=["All Converted Logs (Consolidated)"] + log_names,
-            index=0 if len(log_names) > 1 else 1,
-            help="Choose an individual log file or query across all converted logs simultaneously.",
+    # Scope Selection
+    file_options = {os.path.basename(f): f for f in available_files}
+    log_names = list(file_options.keys())
+
+    # Sidebar Assistant Controls
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Investigation Scope")
+    selected_log_name = st.sidebar.selectbox(
+        "Target Log File:",
+        options=["All Converted Logs (Consolidated)"] + log_names,
+        index=0 if len(log_names) > 1 else 1,
+        help="Choose an individual log file or query across all converted logs simultaneously.",
+    )
+
+    force_resync = st.sidebar.button("🔄 Re-Index Scope in DuckDB & Qdrant", **stretch_kw())
+
+    if st.sidebar.button("🗑️ Clear Chat History", **stretch_kw()):
+        st.session_state["chatbot_messages"] = [
+            {
+                "role": "assistant",
+                "content": "👋 **Hello! I'm your Forensic AI Assistant.** Ask any question about your event logs in plain English to investigate alerts, hunt threats, or inspect specific system behaviors.",
+                "filter_card": None,
+                "templates": None,
+                "evidence": None,
+            }
+        ]
+        st.rerun()
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🤖 Qwen Answer Engine")
+    st.sidebar.selectbox(
+        "Serving Backend:",
+        options=["auto", "mock", "transformers", "ollama"],
+        index=0,
+        help="Swappable Qwen serving backend ('auto' auto-detects Ollama/local pipeline).",
+        key="sel_llm_backend",
+    )
+    st.sidebar.text_input(
+        "Qwen Model / Variant:",
+        value="Qwen/Qwen2.5-7B-Instruct",
+        help="Configurable Qwen variant identifier (e.g. Qwen/Qwen2.5-7B-Instruct, Qwen/Qwen2.5-1.5B-Instruct).",
+        key="input_llm_model",
+    )
+
+    # Connect to DuckDB and sync records
+    conn = get_duckdb_conn()
+
+    with st.spinner("Synchronizing logs with DuckDB & Drain3 templater..."):
+        if selected_log_name == "All Converted Logs (Consolidated)":
+            dfs = []
+            for fn, fp in file_options.items():
+                temp_df = load_log_data(fp)
+                if not temp_df.empty:
+                    temp_df["SourceLog"] = fn
+                    dfs.append(temp_df)
+            active_df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+            scope_label = f"All Logs ({len(dfs)} files)"
+        else:
+            active_df = load_log_data(file_options[selected_log_name])
+            scope_label = selected_log_name
+
+        if not active_df.empty:
+            last_synced = st.session_state.get("synced_scope")
+            if last_synced != scope_label or force_resync:
+                sync_res = sync_dataframe_to_duckdb(conn, active_df, scope_label, force_resync=force_resync)
+                st.session_state["synced_scope"] = scope_label
+                st.session_state["sync_res"] = sync_res
+
+    # Retrieve DB metrics
+    total_rec_count = 0
+    total_tpl_count = 0
+    total_vec_count = 0
+    total_corr_count = 0
+    try:
+        total_rec_count = conn.execute("SELECT COUNT(*) FROM canonical_logs").fetchone()[0]
+        total_tpl_count = conn.execute("SELECT COUNT(*) FROM log_templates").fetchone()[0]
+        v_idx = get_vector_index(get_embedder())
+        total_vec_count = v_idx.client.count(v_idx.collection_name).count
+        all_tbls = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
+        if "entity_correlations" in all_tbls:
+            total_corr_count = conn.execute("SELECT COUNT(*) FROM entity_correlations").fetchone()[0]
+    except Exception:
+        pass
+
+    dedup_ratio = 0.0
+    if total_rec_count > 0 and total_tpl_count > 0:
+        dedup_ratio = max(0.0, (1.0 - (total_tpl_count / total_rec_count)) * 100.0)
+
+    # Hero Header & KPI Metrics
+    st.title("🤖 Windows Forensic Assistant")
+    st.markdown(
+        "Chat with your event logs using **natural language (NLP)**. "
+        "Powered by **Drain3 log clustering**, **BGE technical embeddings**, **DuckDB canonical verification**, "
+        "and **Cross-Channel Entity Correlation**."
+    )
+
+    kpi_col1, kpi_col2, kpi_col3, kpi_col4, kpi_col5 = st.columns(5)
+    with kpi_col1:
+        st.metric("Investigation Scope", scope_label[:18] + ("..." if len(scope_label) > 18 else ""))
+    with kpi_col2:
+        st.metric("Canonical Records", f"{total_rec_count:,}")
+    with kpi_col3:
+        st.metric("Drain3 Templates", f"{total_tpl_count:,}", delta=f"{dedup_ratio:.1f}% Dedup" if dedup_ratio > 0 else None)
+    with kpi_col4:
+        st.metric("Vector Index", f"🟢 {total_vec_count:,} Vectors")
+    with kpi_col5:
+        st.metric("Correlations", f"🔗 {total_corr_count:,} Links")
+
+    # INTEGRATED CLUSTERED TEMPLATES & DEDUP EXPLORER
+    with st.expander("🧩 Drain3 Clustered Templates & Evidentiary Traceability Matrix", expanded=False):
+        st.markdown(
+            "Inspect how near-identical log records were deduplicated into structural templates while maintaining **100% evidentiary traceability** back to every original record."
         )
 
-        force_resync = st.sidebar.button("🔄 Re-Index Scope in DuckDB & Qdrant", **stretch_kw())
+        tpl_search_col, tpl_btn_col = st.columns([3, 1])
+        with tpl_search_col:
+            tpl_kw = st.text_input("Search Mined Templates by Keyword or Event ID:", placeholder="e.g. 4625, logon, USB...", key="tpl_matrix_search")
+        with tpl_btn_col:
+            st.write("")
+            st.write("")
+            if st.button("🔄 Re-Mine Templates", **stretch_kw()):
+                with st.spinner("Re-mining templates with Drain3..."):
+                    mgr = get_drain3_mgr()
+                    mgr.process_canonical_records(conn, canonical_table="canonical_logs")
+                    v_idx = get_vector_index(get_embedder())
+                    v_idx.index_from_duckdb(conn, templates_table="log_templates")
+                    st.success("Templates and vectors refreshed!")
+                    st.rerun()
 
-        if st.sidebar.button("🗑️ Clear Chat History", **stretch_kw()):
-            st.session_state["chatbot_messages"] = [
-                {
-                    "role": "assistant",
-                    "content": "👋 **Hello! I'm your Forensic AI Assistant.** Ask any question about your event logs in plain English to investigate alerts, hunt threats, or inspect specific system behaviors.",
-                    "filter_card": None,
-                    "templates": None,
-                    "evidence": None,
-                }
-            ]
-            st.rerun()
+        query_tpl_sql = "SELECT template_id, source_type, provider, event_id, level, total_count, first_seen_utc, last_seen_utc, template_string FROM log_templates"
+        tpl_params = []
+        if tpl_kw and tpl_kw.strip():
+            query_tpl_sql += " WHERE LOWER(template_string) LIKE ? OR event_id LIKE ?"
+            kw_p = f"%{tpl_kw.strip().lower()}%"
+            tpl_params = [kw_p, f"%{tpl_kw.strip()}%"]
+        query_tpl_sql += " ORDER BY total_count DESC"
 
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("🤖 Qwen Answer Engine")
-        st.sidebar.selectbox(
-            "Serving Backend:",
-            options=["auto", "mock", "transformers", "ollama"],
-            index=0,
-            help="Swappable Qwen serving backend ('auto' auto-detects Ollama/local pipeline).",
-            key="sel_llm_backend",
-        )
-        st.sidebar.text_input(
-            "Qwen Model / Variant:",
-            value="Qwen/Qwen2.5-7B-Instruct",
-            help="Configurable Qwen variant identifier (e.g. Qwen/Qwen2.5-7B-Instruct, Qwen/Qwen2.5-1.5B-Instruct).",
-            key="input_llm_model",
-        )
-
-        # Connect to DuckDB and sync records
-        conn = get_duckdb_conn()
-
-        with st.spinner("Synchronizing logs with DuckDB & Drain3 templater..."):
-            if selected_log_name == "All Converted Logs (Consolidated)":
-                dfs = []
-                for fn, fp in file_options.items():
-                    temp_df = load_log_data(fp)
-                    if not temp_df.empty:
-                        temp_df["SourceLog"] = fn
-                        dfs.append(temp_df)
-                active_df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-                scope_label = f"All Logs ({len(dfs)} files)"
-            else:
-                active_df = load_log_data(file_options[selected_log_name])
-                scope_label = selected_log_name
-
-            # Ingest and cluster into DuckDB
-            if not active_df.empty:
-                last_synced = st.session_state.get("synced_scope")
-                if last_synced != scope_label or force_resync:
-                    sync_res = sync_dataframe_to_duckdb(conn, active_df, scope_label, force_resync=force_resync)
-                    st.session_state["synced_scope"] = scope_label
-                    st.session_state["sync_res"] = sync_res
-
-        # Retrieve DB metrics
-        total_rec_count = 0
-        total_tpl_count = 0
-        total_vec_count = 0
-        total_corr_count = 0
         try:
-            total_rec_count = conn.execute("SELECT COUNT(*) FROM canonical_logs").fetchone()[0]
-            total_tpl_count = conn.execute("SELECT COUNT(*) FROM log_templates").fetchone()[0]
-            v_idx = get_vector_index(get_embedder())
-            total_vec_count = v_idx.client.count(v_idx.collection_name).count
-            all_tbls = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
-            if "entity_correlations" in all_tbls:
-                total_corr_count = conn.execute("SELECT COUNT(*) FROM entity_correlations").fetchone()[0]
+            matrix_tpl_df = conn.execute(query_tpl_sql, tpl_params).df()
+            st.dataframe(matrix_tpl_df, **stretch_kw())
+
+            all_tids = matrix_tpl_df["template_id"].tolist()
+            if all_tids:
+                st.markdown("##### 🔗 100% Evidentiary Traceability Drilldown")
+                sel_tid = st.selectbox("Select Template to Trace:", options=all_tids, key="sel_trace_tpl")
+                if sel_tid:
+                    mgr = get_drain3_mgr()
+                    full_inst_records = mgr.get_records_for_template(conn, sel_tid, canonical_table="canonical_logs")
+
+                    inst_m1, inst_m2 = st.columns(2)
+                    with inst_m1:
+                        st.metric("Total Represented Instances", f"{len(full_inst_records):,} records")
+                    with inst_m2:
+                        st.metric("Traceability Guarantee", "100% Exact (Zero Sampling)")
+
+                    p_cols = [c for c in ["RecordID", "event_record_id", "TimeCreated", "time_created_utc", "LevelName", "Level", "EventID", "Channel", "Computer", "UserID", "Message"] if c in full_inst_records.columns]
+                    st.dataframe(full_inst_records[p_cols if p_cols else full_inst_records.columns[:8]], **stretch_kw())
+
+                    csv_dl = full_inst_records.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        label="📥 Download Template Records as CSV",
+                        data=csv_dl,
+                        file_name=f"{sel_tid}_instances.csv",
+                        mime="text/csv",
+                        key=f"dl_matrix_{sel_tid}",
+                    )
+        except Exception as e:
+            st.info(f"No templates currently loaded: {e}")
+
+    # INTEGRATED CROSS-CHANNEL CORRELATION EXPLORER
+    with st.expander("🔗 Cross-Channel Correlation Explorer & Causal Sequence Graph", expanded=False):
+        st.markdown(
+            "Link events across **Application**, **System**, and **Security** logs via shared entity identifiers "
+            "(Logon IDs, Activity GUIDs, User SIDs, Network IPs, and Process instances) within strict temporal proximity windows."
+        )
+
+        all_tbls_corr = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
+        if "entity_correlations" not in all_tbls_corr:
+            st.info("Correlation index is not yet built in DuckDB. Click **Re-Index Scope in DuckDB & Qdrant** in the sidebar to build.")
+        else:
+            corr_c1, corr_c2, corr_c3 = st.columns([2.2, 2.2, 1.2])
+            with corr_c1:
+                anchor_input = st.text_input("Anchor Event Record ID:", placeholder="e.g. 100, 1204...", key="corr_panel_anchor")
+            with corr_c2:
+                conf_options = [
+                    ("All Valid Entities (Weight >= 0.2)", 0.2),
+                    ("High Confidence Only (1.0) - Logon/Activity/PID Instance", 0.95),
+                    ("Medium-High (0.8+) - User SID", 0.75),
+                    ("Medium (0.6+) - IP Address", 0.55),
+                ]
+                sel_conf_idx = st.selectbox(
+                    "Minimum Confidence Filter:",
+                    options=range(len(conf_options)),
+                    format_func=lambda i: conf_options[i][0],
+                    index=0,
+                    key="corr_panel_min_conf",
+                )
+                min_conf_val = conf_options[sel_conf_idx][1]
+            with corr_c3:
+                st.write("")
+                st.write("")
+                btn_run_corr = st.button("🔎 Trace Links", **stretch_kw())
+
+            if (btn_run_corr or anchor_input) and anchor_input.strip():
+                clean_anchor = anchor_input.strip()
+                corr_mgr = get_correlation_mgr()
+                c_results = corr_mgr.find_correlated(
+                    conn=conn,
+                    anchor_event_record_id=clean_anchor,
+                    min_confidence_weight=min_conf_val,
+                    limit=50,
+                )
+                if c_results:
+                    st.markdown(f"##### 🎯 Found {len(c_results):,} Cross-Channel Event(s) Correlated with Record `#{clean_anchor}`")
+                    c_df = pd.DataFrame(c_results)
+                    disp_cols = [c for c in ["time_delta_str", "source_type", "event_id", "entity_type", "entity_value", "confidence", "relation_reason"] if c in c_df.columns]
+                    c_df_renamed = c_df[disp_cols].rename(columns={
+                        "time_delta_str": "Time Offset (Δt)",
+                        "source_type": "Channel",
+                        "event_id": "Event ID",
+                        "entity_type": "Linked Entity",
+                        "entity_value": "Entity Value",
+                        "confidence": "Confidence",
+                        "relation_reason": "Relation",
+                    })
+                    st.dataframe(c_df_renamed, **stretch_kw())
+
+                    if st.button(f"💬 Send to Chat Assistant: What else happened around record {clean_anchor}?", key=f"btn_corr_chat_{clean_anchor}", **stretch_kw()):
+                        st.session_state["chatbot_messages"].append({
+                            "role": "user",
+                            "content": f"What else happened around record {clean_anchor}?",
+                            "evidence": None,
+                            "filter_card": None,
+                            "templates": None,
+                        })
+                        st.rerun()
+                else:
+                    st.info(f"No cross-channel correlated events found within temporal proximity windows for Record #{clean_anchor}.")
+
+    st.markdown("---")
+
+    # CHAT INTERFACE & CONVERSATION STREAM
+    if not st.session_state.get("chatbot_messages") or len(st.session_state["chatbot_messages"]) <= 1:
+        st.caption("✨ **Suggested prompts to get started:**")
+        sug_col1, sug_col2, sug_col3 = st.columns(3)
+        submitted_prompt = None
+        with sug_col1:
+            if st.button("🔍 Logon failures for process 1064", **stretch_kw()):
+                submitted_prompt = "Show me logon failure events for process 1064 yesterday"
+            if st.button("🛡️ Critical errors in System log", **stretch_kw()):
+                submitted_prompt = "What critical errors occurred in System log?"
+        with sug_col2:
+            if st.button("🔌 USB reader disconnect events", **stretch_kw()):
+                submitted_prompt = "Find USB reader disconnect events"
+            if st.button("⚡ Process creation and execution trace", **stretch_kw()):
+                submitted_prompt = "Show me process creation events"
+        with sug_col3:
+            if st.button("🔗 What else happened around process 1064?", **stretch_kw()):
+                submitted_prompt = "What else happened around process 1064?"
+            if st.button("🔗 Correlated events for record 100", **stretch_kw()):
+                submitted_prompt = "Show correlated events for record 100"
+    else:
+        submitted_prompt = None
+
+    # Render Chat History
+    for idx, msg in enumerate(st.session_state["chatbot_messages"]):
+        avatar_icon = "🧑‍💻" if msg["role"] == "user" else "✨"
+        with st.chat_message(msg["role"], avatar=avatar_icon):
+            st.markdown(msg["content"])
+
+            ev_df = msg.get("evidence")
+            if ev_df is not None and not ev_df.empty:
+                with st.expander(f"🔎 Evidence Artifacts ({len(ev_df):,} matching events)", expanded=True):
+                    pref_cols = [
+                        c for c in ["TimeDelta", "Confidence", "RelationReason", "RecordID", "event_record_id",
+                                    "TimeCreated", "time_created_utc", "LevelName", "Level", "level", "EventID",
+                                    "event_id", "Channel", "source_type", "Computer", "computer", "ProcessID",
+                                    "process_id", "UserID", "user_id", "Message", "message"]
+                        if c in ev_df.columns
+                    ]
+                    display_cols = pref_cols if pref_cols else list(ev_df.columns[:8])
+                    st.dataframe(ev_df[display_cols].head(250), **stretch_kw())
+
+                    ev_csv = ev_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        label="📥 Download Evidence as CSV",
+                        data=ev_csv,
+                        file_name=f"forensic_evidence_{idx}.csv",
+                        mime="text/csv",
+                        key=f"btn_dl_ev_{idx}",
+                    )
+
+            audit_meta = msg.get("audit_metadata")
+            if audit_meta:
+                with st.expander(f"🛡️ Reproducibility Audit Trail & Qwen Context Batches ({msg.get('query_id', 'QID')})", expanded=False):
+                    a_col1, a_col2, a_col3, a_col4 = st.columns(4)
+                    with a_col1:
+                        st.metric("Model Engine", str(audit_meta.get("model_name", "Qwen2.5")))
+                    with a_col2:
+                        st.metric("Serving Backend", str(audit_meta.get("backend", "auto")))
+                    with a_col3:
+                        st.metric("LLM Latency", f"{audit_meta.get('llm_latency_ms', 0):.0f} ms")
+                    with a_col4:
+                        st.metric("Pipeline Latency", f"{audit_meta.get('pipeline_latency_ms', 0):.0f} ms")
+
+                    batches = msg.get("context_batches")
+                    if batches:
+                        st.markdown(f"**Dispatched Context Batches ({len(batches)} batches sent to Qwen):**")
+                        for b_idx, b_text in enumerate(batches):
+                            st.code(b_text, language="text")
+
+    # Chat Input Bar
+    user_input = st.chat_input("Ask a forensic question in plain English (e.g. 'Show me logon failures for process 1064 yesterday')...")
+    active_query = submitted_prompt or user_input
+
+    if not active_query:
+        return
+
+    st.session_state["chatbot_messages"].append(
+        {"role": "user", "content": active_query, "evidence": None, "filter_card": None, "templates": None}
+    )
+
+    with st.spinner("Thinking... Parsing NLP query, searching vector index, and verifying DuckDB evidence with Qwen..."):
+        # Step 1: Discover dataset time bounds
+        time_bounds = None
+        max_ref_time = None
+        try:
+            tb = conn.execute("SELECT MIN(TimeCreated), MAX(TimeCreated) FROM canonical_logs").fetchone()
+            if tb and tb[0] and tb[1]:
+                time_bounds = (str(tb[0]), str(tb[1]))
+                try:
+                    max_ref_time = date_parser.parse(str(tb[1]))
+                except Exception:
+                    pass
         except Exception:
             pass
 
-        dedup_ratio = 0.0
-        if total_rec_count > 0 and total_tpl_count > 0:
-            dedup_ratio = max(0.0, (1.0 - (total_tpl_count / total_rec_count)) * 100.0)
+        # Step 2: Initialize Pipeline and Execute
+        backend_choice = st.session_state.get("sel_llm_backend", "auto")
+        model_choice = st.session_state.get("input_llm_model", "Qwen/Qwen2.5-7B-Instruct")
+        pipeline = get_retrieval_pipeline(backend_type=backend_choice, model_name=model_choice)
+        v_idx = get_vector_index(get_embedder())
 
-        # Gemini Hero Header
-        st.title("🤖 Windows Forensic Assistant")
-        st.markdown(
-            "Chat with your event logs using **natural language (NLP)**. "
-            "Powered by **Drain3 log clustering**, **BGE technical embeddings**, **DuckDB canonical verification**, "
-            "and **Cross-Channel Entity Correlation**."
+        pipe_res = pipeline.execute(
+            conn=conn,
+            user_query=active_query,
+            vector_index=v_idx,
+            reference_time=max_ref_time,
+            data_bounds=time_bounds,
+            canonical_table="canonical_logs",
         )
 
-        # KPI Metrics Cards Banner
-        kpi_col1, kpi_col2, kpi_col3, kpi_col4, kpi_col5 = st.columns(5)
-        with kpi_col1:
-            st.metric("Investigation Scope", scope_label[:18] + ("..." if len(scope_label) > 18 else ""))
-        with kpi_col2:
-            st.metric("Canonical Records", f"{total_rec_count:,}")
-        with kpi_col3:
-            st.metric("Drain3 Templates", f"{total_tpl_count:,}", delta=f"{dedup_ratio:.1f}% Dedup" if dedup_ratio > 0 else None)
-        with kpi_col4:
-            st.metric("Vector Index", f"🟢 {total_vec_count:,} Vectors")
-        with kpi_col5:
-            st.metric("Correlations", f"🔗 {total_corr_count:,} Links")
+        qf = pipe_res.query_filter
+        time_range_str = f"{qf.time_range.start_utc} to {qf.time_range.end_utc} (UTC)" if qf.time_range else "Unbounded"
+        entities_str = ", ".join(f"{k}={v}" for k, v in qf.entity_filters.to_dict().items() if v) or "None"
 
-        # ----------------------------------------------------------------------
-        # INTEGRATED CLUSTERED TEMPLATES & DEDUP EXPLORER (EXPANDABLE PANEL)
-        # ----------------------------------------------------------------------
-        with st.expander("🧩 Drain3 Clustered Templates & Evidentiary Traceability Matrix", expanded=False):
-            st.markdown(
-                "Inspect how near-identical log records were deduplicated into structural templates while maintaining **100% evidentiary traceability** back to every original record."
-            )
+        filter_card = {
+            "intent": qf.intent,
+            "source_type": qf.source_type,
+            "event_id": qf.event_id,
+            "level": qf.level,
+            "time_range": time_range_str,
+            "entities": entities_str,
+            "semantic_query": qf.semantic_query,
+        }
 
-            # Template Search Filter
-            tpl_search_col, tpl_btn_col = st.columns([3, 1])
-            with tpl_search_col:
-                tpl_kw = st.text_input("Search Mined Templates by Keyword or Event ID:", placeholder="e.g. 4625, logon, USB...", key="tpl_matrix_search")
-            with tpl_btn_col:
-                st.write("")
-                st.write("")
-                if st.button("🔄 Re-Mine Templates", **stretch_kw()):
-                    with st.spinner("Re-mining templates with Drain3..."):
-                        mgr = get_drain3_mgr()
-                        mgr.process_canonical_records(conn, canonical_table="canonical_logs")
-                        v_idx.index_from_duckdb(conn, templates_table="log_templates")
-                        st.success("Templates and vectors refreshed!")
-                        st.rerun()
+        matched_records = pipe_res.retrieved_records
+        correlated_results = pipe_res.correlated_records
+        anchor_record_data = None
 
-            # Mined Templates Table
-            query_tpl_sql = "SELECT template_id, source_type, provider, event_id, level, total_count, first_seen_utc, last_seen_utc, template_string FROM log_templates"
-            tpl_params = []
-            if tpl_kw and tpl_kw.strip():
-                query_tpl_sql += " WHERE LOWER(template_string) LIKE ? OR event_id LIKE ?"
-                kw_p = f"%{tpl_kw.strip().lower()}%"
-                tpl_params = [kw_p, f"%{tpl_kw.strip()}%"]
-            query_tpl_sql += " ORDER BY total_count DESC"
+        rec_col_name = "RecordID" if "RecordID" in matched_records.columns else "event_record_id"
+        if correlated_results:
+            anchor_id = None
+            if qf.entity_filters.event_record_id:
+                anchor_id = str(qf.entity_filters.event_record_id).strip().replace(".0", "")
+            elif not matched_records.empty:
+                for _, r in matched_records.iterrows():
+                    rid = str(r.get(rec_col_name, "")).replace(".0", "")
+                    if rid not in [str(c.get("event_record_id", "")).replace(".0", "") for c in correlated_results]:
+                        anchor_id = rid
+                        break
+                if not anchor_id:
+                    anchor_id = str(matched_records.iloc[0].get(rec_col_name, "")).replace(".0", "")
 
-            try:
-                matrix_tpl_df = conn.execute(query_tpl_sql, tpl_params).df()
-                st.dataframe(matrix_tpl_df, **stretch_kw())
+            if anchor_id and not matched_records.empty:
+                anchor_match = matched_records[matched_records[rec_col_name].astype(str).str.replace(".0", "", regex=False) == anchor_id]
+                if not anchor_match.empty:
+                    anchor_record_data = anchor_match.iloc[0].to_dict()
 
-                # Traceability Inspector
-                all_tids = matrix_tpl_df["template_id"].tolist()
-                if all_tids:
-                    st.markdown("##### 🔗 100% Evidentiary Traceability Drilldown")
-                    sel_tid = st.selectbox("Select Template to Trace:", options=all_tids, key="sel_trace_tpl")
-                    if sel_tid:
-                        mgr = get_drain3_mgr()
-                        full_inst_records = mgr.get_records_for_template(conn, sel_tid, canonical_table="canonical_logs")
-                        
-                        inst_m1, inst_m2 = st.columns(2)
-                        with inst_m1:
-                            st.metric("Total Represented Instances", f"{len(full_inst_records):,} records")
-                        with inst_m2:
-                            st.metric("Traceability Guarantee", "100% Exact (Zero Sampling)")
+            if not matched_records.empty and "RelationReason" not in matched_records.columns:
+                corr_map = {str(r["event_record_id"]).replace(".0", ""): r for r in correlated_results}
 
-                        p_cols = [c for c in ["RecordID", "event_record_id", "TimeCreated", "time_created_utc", "LevelName", "Level", "EventID", "Channel", "Computer", "UserID", "Message"] if c in full_inst_records.columns]
-                        st.dataframe(full_inst_records[p_cols if p_cols else full_inst_records.columns[:8]], **stretch_kw())
+                def get_corr_delta(row: Any) -> str:
+                    rid = str(row.get(rec_col_name, "")).replace(".0", "")
+                    if anchor_id and rid == anchor_id:
+                        return "0s (Anchor)"
+                    return corr_map.get(rid, {}).get("time_delta_str", "-")
 
-                        csv_dl = full_inst_records.to_csv(index=False).encode("utf-8")
-                        st.download_button(
-                            label="📥 Download Template Records as CSV",
-                            data=csv_dl,
-                            file_name=f"{sel_tid}_instances.csv",
-                            mime="text/csv",
-                            key=f"dl_matrix_{sel_tid}",
-                        )
-            except Exception as e:
-                st.info(f"No templates currently loaded: {e}")
+                def get_corr_conf(row: Any) -> str:
+                    rid = str(row.get(rec_col_name, "")).replace(".0", "")
+                    if anchor_id and rid == anchor_id:
+                        return "Anchor (1.0)"
+                    return corr_map.get(rid, {}).get("confidence", "-")
 
-        # ----------------------------------------------------------------------
-        # INTEGRATED CROSS-CHANNEL CORRELATION EXPLORER (EXPANDABLE PANEL)
-        # ----------------------------------------------------------------------
-        with st.expander("🔗 Cross-Channel Correlation Explorer & Causal Sequence Graph", expanded=False):
-            st.markdown(
-                "Link events across **Application**, **System**, and **Security** logs via shared entity identifiers "
-                "(Logon IDs, Activity GUIDs, User SIDs, Network IPs, and Process instances) within strict temporal proximity windows."
-            )
+                def get_corr_reason(row: Any) -> str:
+                    rid = str(row.get(rec_col_name, "")).replace(".0", "")
+                    if anchor_id and rid == anchor_id:
+                        return "Anchor Event"
+                    return corr_map.get(rid, {}).get("relation_reason", "-")
 
-            all_tbls_corr = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
-            if "entity_correlations" not in all_tbls_corr:
-                st.info("Correlation index is not yet built in DuckDB. Click **Re-Index Scope in DuckDB & Qdrant** in the sidebar to build.")
-            else:
-                corr_c1, corr_c2, corr_c3 = st.columns([2.2, 2.2, 1.2])
-                with corr_c1:
-                    anchor_input = st.text_input("Anchor Event Record ID:", placeholder="e.g. 100, 1204...", key="corr_panel_anchor")
-                with corr_c2:
-                    conf_options = [
-                        ("All Valid Entities (Weight >= 0.2)", 0.2),
-                        ("High Confidence Only (1.0) - Logon/Activity/PID Instance", 0.95),
-                        ("Medium-High (0.8+) - User SID", 0.75),
-                        ("Medium (0.6+) - IP Address", 0.55),
-                    ]
-                    sel_conf_idx = st.selectbox(
-                        "Minimum Confidence Filter:",
-                        options=range(len(conf_options)),
-                        format_func=lambda i: conf_options[i][0],
-                        index=0,
-                        key="corr_panel_min_conf",
-                    )
-                    min_conf_val = conf_options[sel_conf_idx][1]
-                with corr_c3:
-                    st.write("")
-                    st.write("")
-                    btn_run_corr = st.button("🔎 Trace Links", **stretch_kw())
+                matched_records.insert(0, "RelationReason", matched_records.apply(get_corr_reason, axis=1))
+                matched_records.insert(0, "Confidence", matched_records.apply(get_corr_conf, axis=1))
+                matched_records.insert(0, "TimeDelta", matched_records.apply(get_corr_delta, axis=1))
 
-                if (btn_run_corr or anchor_input) and anchor_input.strip():
-                    clean_anchor = anchor_input.strip()
-                    corr_mgr = get_correlation_mgr()
-                    c_results = corr_mgr.find_correlated(
-                        conn=conn,
-                        anchor_event_record_id=clean_anchor,
-                        min_confidence_weight=min_conf_val,
-                        limit=50,
-                    )
-                    if c_results:
-                        st.markdown(f"##### 🎯 Found {len(c_results):,} Cross-Channel Event(s) Correlated with Record `#{clean_anchor}`")
-                        c_df = pd.DataFrame(c_results)
-                        disp_cols = [c for c in ["time_delta_str", "source_type", "event_id", "entity_type", "entity_value", "confidence", "relation_reason"] if c in c_df.columns]
-                        c_df_renamed = c_df[disp_cols].rename(columns={
-                            "time_delta_str": "Time Offset (Δt)",
-                            "source_type": "Channel",
-                            "event_id": "Event ID",
-                            "entity_type": "Linked Entity",
-                            "entity_value": "Entity Value",
-                            "confidence": "Confidence",
-                            "relation_reason": "Relation",
-                        })
-                        st.dataframe(c_df_renamed, **stretch_kw())
+        # Step 3: Synthesize ChatGPT-Style Conversational Forensic Response
+        resp_text = generate_chatgpt_forensic_response(
+            query=active_query,
+            qf=qf,
+            records=matched_records,
+            templates=pipe_res.matched_templates,
+            scope_label=scope_label,
+            total_scope_records=total_rec_count,
+            conn=conn,
+            correlated_events=correlated_results,
+            anchor_record=anchor_record_data,
+            qwen_answer=pipe_res.answer,
+            audit_metadata=pipe_res.audit_metadata,
+        )
 
-                        if st.button(f"💬 Send to Chat Assistant: What else happened around record {clean_anchor}?", key=f"btn_corr_chat_{clean_anchor}", **stretch_kw()):
-                            st.session_state["chatbot_messages"].append({
-                                "role": "user",
-                                "content": f"What else happened around record {clean_anchor}?",
-                                "evidence": None,
-                                "filter_card": None,
-                                "templates": None,
-                            })
-                            st.rerun()
-                    else:
-                        st.info(f"No cross-channel correlated events found within temporal proximity windows for Record #{clean_anchor}.")
+    st.session_state["chatbot_messages"].append(
+        {
+            "role": "assistant",
+            "content": resp_text,
+            "filter_card": filter_card,
+            "templates": pipe_res.matched_templates,
+            "evidence": matched_records,
+            "query_id": pipe_res.query_id,
+            "context_batches": pipe_res.context_batches,
+            "audit_metadata": pipe_res.audit_metadata,
+            "citations": pipe_res.citations,
+        }
+    )
+    st.rerun()
 
-        st.markdown("---")
 
-        # ----------------------------------------------------------------------
-        # GEMINI CHAT INTERFACE & CONVERSATION STREAM
-        # ----------------------------------------------------------------------
-        # Welcoming suggestions if chat is empty
-        if not st.session_state.get("chatbot_messages") or len(st.session_state["chatbot_messages"]) <= 1:
-            st.caption("✨ **Suggested prompts to get started:**")
-            sug_col1, sug_col2, sug_col3 = st.columns(3)
-            submitted_prompt = None
-            with sug_col1:
-                if st.button("🔍 Logon failures for process 1064", **stretch_kw()):
-                    submitted_prompt = "Show me logon failure events for process 1064 yesterday"
-                if st.button("🛡️ Critical errors in System log", **stretch_kw()):
-                    submitted_prompt = "What critical errors occurred in System log?"
-            with sug_col2:
-                if st.button("🔌 USB reader disconnect events", **stretch_kw()):
-                    submitted_prompt = "Find USB reader disconnect events"
-                if st.button("⚡ Process creation and execution trace", **stretch_kw()):
-                    submitted_prompt = "Show me process creation events"
-            with sug_col3:
-                if st.button("🔗 What else happened around process 1064?", **stretch_kw()):
-                    submitted_prompt = "What else happened around process 1064?"
-                if st.button("🔗 Correlated events for record 100", **stretch_kw()):
-                    submitted_prompt = "Show correlated events for record 100"
-        else:
-            submitted_prompt = None
+# ------------------------------------------------------------------------------
+# APPLICATION ENTRYPOINT
+# ------------------------------------------------------------------------------
 
-        # Render Chat History
-        for idx, msg in enumerate(st.session_state["chatbot_messages"]):
-            avatar_icon = "🧑‍💻" if msg["role"] == "user" else "✨"
-            with st.chat_message(msg["role"], avatar=avatar_icon):
-                st.markdown(msg["content"])
+def main() -> None:
+    """Main application orchestrator."""
+    inject_custom_styles()
+    init_session_state()
+    active_tab = render_sidebar()
 
-                # Render Evidence Artifacts Grid
-                ev_df = msg.get("evidence")
-                if ev_df is not None and not ev_df.empty:
-                    with st.expander(f"🔎 Evidence Artifacts ({len(ev_df):,} matching events)", expanded=True):
-                        pref_cols = [
-                            c for c in ["TimeDelta", "Confidence", "RelationReason", "RecordID", "event_record_id", "TimeCreated", "time_created_utc", "LevelName", "Level", "level", "EventID", "event_id", "Channel", "source_type", "Computer", "computer", "ProcessID", "process_id", "UserID", "user_id", "Message", "message"]
-                            if c in ev_df.columns
-                        ]
-                        display_cols = pref_cols if pref_cols else list(ev_df.columns[:8])
-                        st.dataframe(ev_df[display_cols].head(250), **stretch_kw())
+    if active_tab == "converter":
+        render_converter_view()
+    elif active_tab == "viewer":
+        render_viewer_view()
+    elif active_tab == "assistant":
+        render_assistant_view()
 
-                        # Download matched evidence
-                        ev_csv = ev_df.to_csv(index=False).encode("utf-8")
-                        st.download_button(
-                            label="📥 Download Evidence as CSV",
-                            data=ev_csv,
-                            file_name=f"forensic_evidence_{idx}.csv",
-                            mime="text/csv",
-                            key=f"btn_dl_ev_{idx}",
-                        )
 
-                audit_meta = msg.get("audit_metadata")
-                if audit_meta:
-                    with st.expander(f"🛡️ Reproducibility Audit Trail & Qwen Context Batches ({msg.get('query_id', 'QID')})", expanded=False):
-                        a_col1, a_col2, a_col3, a_col4 = st.columns(4)
-                        with a_col1:
-                            st.metric("Model Engine", str(audit_meta.get("model_name", "Qwen2.5")))
-                        with a_col2:
-                            st.metric("Serving Backend", str(audit_meta.get("backend", "auto")))
-                        with a_col3:
-                            st.metric("LLM Latency", f"{audit_meta.get('llm_latency_ms', 0):.0f} ms")
-                        with a_col4:
-                            st.metric("Pipeline Latency", f"{audit_meta.get('pipeline_latency_ms', 0):.0f} ms")
-
-                        batches = msg.get("context_batches")
-                        if batches:
-                            st.markdown(f"**Dispatched Context Batches ({len(batches)} batches sent to Qwen):**")
-                            for b_idx, b_text in enumerate(batches):
-                                st.code(b_text, language="text")
-
-        # Chat Input Bar
-        user_input = st.chat_input("Ask a forensic question in plain English (e.g. 'Show me logon failures for process 1064 yesterday')...")
-        active_query = submitted_prompt or user_input
-
-        # Process query if submitted
-        if active_query:
-            st.session_state["chatbot_messages"].append(
-                {"role": "user", "content": active_query, "evidence": None, "filter_card": None, "templates": None}
-            )
-
-            with st.spinner("Thinking... Parsing NLP query, searching vector index, and verifying DuckDB evidence with Qwen..."):
-                # Step 1: Discover dataset time bounds to anchor relative queries
-                time_bounds = None
-                max_ref_time = None
-                try:
-                    tb = conn.execute("SELECT MIN(TimeCreated), MAX(TimeCreated) FROM canonical_logs").fetchone()
-                    if tb and tb[0] and tb[1]:
-                        time_bounds = (str(tb[0]), str(tb[1]))
-                        try:
-                            max_ref_time = date_parser.parse(str(tb[1]))
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                # Step 2: Initialize Pipeline and Execute
-                backend_choice = st.session_state.get("sel_llm_backend", "auto")
-                model_choice = st.session_state.get("input_llm_model", "Qwen/Qwen2.5-7B-Instruct")
-                pipeline = get_retrieval_pipeline(backend_type=backend_choice, model_name=model_choice)
-
-                v_idx = get_vector_index(get_embedder())
-
-                pipe_res = pipeline.execute(
-                    conn=conn,
-                    user_query=active_query,
-                    vector_index=v_idx,
-                    reference_time=max_ref_time,
-                    data_bounds=time_bounds,
-                    canonical_table="canonical_logs",
-                )
-
-                qf = pipe_res.query_filter
-                time_range_str = f"{qf.time_range.start_utc} to {qf.time_range.end_utc} (UTC)" if qf.time_range else "Unbounded"
-                entities_str = ", ".join(f"{k}={v}" for k, v in qf.entity_filters.to_dict().items() if v) or "None"
-
-                filter_card = {
-                    "intent": qf.intent,
-                    "source_type": qf.source_type,
-                    "event_id": qf.event_id,
-                    "level": qf.level,
-                    "time_range": time_range_str,
-                    "entities": entities_str,
-                    "semantic_query": qf.semantic_query,
-                }
-
-                matched_records = pipe_res.retrieved_records
-                correlated_results = pipe_res.correlated_records
-                anchor_record_data = None
-
-                # Find anchor record data if correlation occurred
-                rec_col_name = "RecordID" if "RecordID" in matched_records.columns else "event_record_id"
-                if correlated_results:
-                    anchor_id = None
-                    if qf.entity_filters.event_record_id:
-                        anchor_id = str(qf.entity_filters.event_record_id).strip().replace(".0", "")
-                    elif not matched_records.empty:
-                        for _, r in matched_records.iterrows():
-                            rid = str(r.get(rec_col_name, "")).replace(".0", "")
-                            if rid not in [str(c.get("event_record_id", "")).replace(".0", "") for c in correlated_results]:
-                                anchor_id = rid
-                                break
-                        if not anchor_id:
-                            anchor_id = str(matched_records.iloc[0].get(rec_col_name, "")).replace(".0", "")
-
-                    if anchor_id and not matched_records.empty:
-                        anchor_match = matched_records[matched_records[rec_col_name].astype(str).str.replace(".0", "", regex=False) == anchor_id]
-                        if not anchor_match.empty:
-                            anchor_record_data = anchor_match.iloc[0].to_dict()
-
-                    # Attach correlation columns to matched_records for UI display if not already present
-                    if not matched_records.empty and "RelationReason" not in matched_records.columns:
-                        corr_map = {str(r["event_record_id"]).replace(".0", ""): r for r in correlated_results}
-                        def get_corr_delta(row):
-                            rid = str(row.get(rec_col_name, "")).replace(".0", "")
-                            if anchor_id and rid == anchor_id:
-                                return "0s (Anchor)"
-                            return corr_map.get(rid, {}).get("time_delta_str", "-")
-
-                        def get_corr_conf(row):
-                            rid = str(row.get(rec_col_name, "")).replace(".0", "")
-                            if anchor_id and rid == anchor_id:
-                                return "Anchor (1.0)"
-                            return corr_map.get(rid, {}).get("confidence", "-")
-
-                        def get_corr_reason(row):
-                            rid = str(row.get(rec_col_name, "")).replace(".0", "")
-                            if anchor_id and rid == anchor_id:
-                                return "Anchor Event"
-                            return corr_map.get(rid, {}).get("relation_reason", "-")
-
-                        matched_records.insert(0, "RelationReason", matched_records.apply(get_corr_reason, axis=1))
-                        matched_records.insert(0, "Confidence", matched_records.apply(get_corr_conf, axis=1))
-                        matched_records.insert(0, "TimeDelta", matched_records.apply(get_corr_delta, axis=1))
-
-                # Step 3: Synthesize ChatGPT-Style Conversational Forensic Response
-                resp_text = generate_chatgpt_forensic_response(
-                    query=active_query,
-                    qf=qf,
-                    records=matched_records,
-                    templates=pipe_res.matched_templates,
-                    scope_label=scope_label,
-                    total_scope_records=total_rec_count,
-                    conn=conn,
-                    correlated_events=correlated_results,
-                    anchor_record=anchor_record_data,
-                    qwen_answer=pipe_res.answer,
-                    audit_metadata=pipe_res.audit_metadata,
-                )
-
-            st.session_state["chatbot_messages"].append(
-                {
-                    "role": "assistant",
-                    "content": resp_text,
-                    "filter_card": filter_card,
-                    "templates": pipe_res.matched_templates,
-                    "evidence": matched_records,
-                    "query_id": pipe_res.query_id,
-                    "context_batches": pipe_res.context_batches,
-                    "audit_metadata": pipe_res.audit_metadata,
-                    "citations": pipe_res.citations,
-                }
-            )
-            st.rerun()
-
+if __name__ == "__main__" or (hasattr(st, "runtime") and hasattr(st.runtime, "exists") and st.runtime.exists()):
+    main()
