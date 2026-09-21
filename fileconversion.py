@@ -35,7 +35,7 @@ import sys
 import tempfile
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-# Optional pure-Python fallback support
+# Pure-Python fallback support Mechanism 
 try:
     import Evtx.Evtx as python_evtx
     import xml.etree.ElementTree as ET
@@ -90,7 +90,6 @@ LEVEL_NAMES = {
 
 def normalize_path(path_str: Optional[str]) -> str:
     """Cleans, strips surrounding quotes, expands environment variables and user home (~),
-
     and returns a fully resolved absolute path.
     """
     if not path_str:
@@ -106,7 +105,6 @@ def find_source_files(
     recursive: bool = False,
 ) -> List[str]:
     """Finds all matching source .evtx files from a path, directory, or wildcard pattern.
-
     Removes all source location restrictions.
     """
     raw = str(source_path).strip().strip("'\"")
@@ -164,14 +162,13 @@ def find_source_files(
     return []
 
 
-def resolve_output_path(
+def resolve_output_path( 
     source_file_or_name: str,
     destination: str,
     is_single_file: bool = False,
     output_format: str = "csv",
 ) -> str:
     """Calculates the target filepath for any source and destination without restrictions.
-
     Supports formats: 'csv', 'json', 'jsonl', 'xml'.
     - If destination ends in a supported extension and converting a single file, saves directly to that file.
     - If destination is a directory (or converting multiple files), saves as <basename>.<format> inside it.
@@ -208,7 +205,6 @@ def resolve_output_path(
 
 def find_evtx_dump_tool() -> str:
     """Locates and validates a working native `evtx_dump` binary on the system.
-
     Checks:
     1. Custom EVTX_DUMP_PATH environment variable.
     2. Standard package manager locations (Homebrew, Cargo, Chocolatey, etc.).
@@ -406,7 +402,7 @@ def clean_event_payload(data: Any) -> str:
 
 
 def sanitize_record_row(row: Dict[str, Any]) -> Dict[str, str]:
-    """Ensures all 22 columns are present, and converts any null, None,
+    """Ensures all 23 columns are present, and converts any null, None,
     NaN, or placeholder values into empty strings ("").
     """
     clean_row: Dict[str, str] = {}
@@ -519,7 +515,7 @@ def records_to_xml(records: List[Dict[str, Any]]) -> str:
 
 
 def extract_record_row(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Extracts all 22 standard fields from a raw EVTX event dictionary without dropping any data."""
+    """Extracts all 23 standard fields from a raw EVTX event dictionary without dropping any data."""
     system = event.get("System", {}) if isinstance(event.get("System"), dict) else {}
 
     # 1. Record ID (integer)
@@ -640,8 +636,7 @@ def extract_record_row(event: Dict[str, Any]) -> Dict[str, Any]:
 
 def parse_evtx_python(evtx_path: str, output_path: str, output_format: str = "csv") -> int:
     """Pure-Python fallback parser using `python-evtx` (Evtx.Evtx) and XML parsing.
-
-    Extracts all 22 standard fields and exports records in CSV, JSON, JSONL, or XML.
+    Extracts all 23 standard fields and exports records in CSV, JSON, JSONL, or XML.
     """
     if not HAS_PYTHON_EVTX:
         raise ImportError(
@@ -854,7 +849,6 @@ def parse_evtx(
     dump_tool: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Parses a single .evtx file and writes structured event records to CSV, JSON, JSONL, or XML.
-
     Ensures zero missing columns and zero dropped entries with multiline JSON buffering
     and sequential record sorting.
     """
@@ -1038,7 +1032,6 @@ def convert_from_path(
     output_format: str = "csv",
 ) -> List[Dict[str, Any]]:
     """Converts .evtx file(s) given any path (file, directory, or wildcard) and stores CSVs, JSON, JSONL, or XML.
-
     No restrictions on source location or destination directory/file format.
     """
     target_files = find_source_files(source_path, selected_files=selected_files, recursive=recursive)
@@ -1090,9 +1083,8 @@ def convert_from_upload(
     dump_tool: Optional[str] = None,
     output_format: str = "csv",
 ) -> Dict[str, Any]:
-    """Converts an uploaded file (Streamlit UploadedFile, BytesIO, or raw bytes) to CSV, JSON, JSONL, or XML.
-
-    Stores the output file with all 22 columns at the designated destination.
+    """Converts an uploaded file (Streamlit UploadedFile, BytesIO, or raw bytes) to CSV, JSON, JSONL, or XML.1
+    Stores the output file with all 23 columns at the designated destination.
     """
     actual_name = filename or getattr(uploaded_file, "name", None) or "uploaded_event_log.evtx"
     out_file = resolve_output_path(actual_name, output_dir, is_single_file=True, output_format=output_format)
